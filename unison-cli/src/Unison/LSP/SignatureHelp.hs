@@ -20,7 +20,7 @@ import Unison.HashQualified qualified as HQ
 import Unison.LSP.Conversions (annToRange, lspToUPos)
 import Unison.LSP.FileAnalysis (getFileSummary, ppedForFile)
 import Unison.LSP.FileAnalysis qualified as FileAnalysis
-import Unison.LSP.Queries (removeInferredTypeAnnotations)
+import Unison.LSP.Queries (refInTerm, removeInferredTypeAnnotations)
 import Unison.LSP.Types
 import Unison.LabeledDependency qualified as LD
 import Unison.Lexer.Pos (Pos)
@@ -117,12 +117,12 @@ sigHelp uri pos = do
 renderFuncLabel :: PPE.PrettyPrintEnv -> Term Symbol Ann -> Text
 renderFuncLabel ppe term = case ABT.out term of
   ABT.Var v -> Var.name v
-  ABT.Tm f -> case f of
-    Term.Ref ref -> HQ.toTextWith SName.toText $ PPE.termName ppe (Referent.Ref ref)
-    Term.Constructor conRef -> HQ.toTextWith SName.toText $ PPE.termName ppe (Referent.Con conRef CT.Data)
-    Term.Request conRef -> HQ.toTextWith SName.toText $ PPE.termName ppe (Referent.Con conRef CT.Effect)
-    _ -> "fn"
+  ABT.Tm (Term.Ref ref) -> nameOf (Referent.Ref ref)
+  ABT.Tm (Term.Constructor conRef) -> nameOf (Referent.Con conRef CT.Data)
+  ABT.Tm (Term.Request conRef) -> nameOf (Referent.Con conRef CT.Effect)
   _ -> "fn"
+  where
+    nameOf = HQ.toTextWith SName.toText . PPE.termName ppe
 
 -- | Get the type of a function term.
 -- Returns a Context.Type which uses TypeVar variables (from the typechecker).
@@ -131,7 +131,7 @@ getFuncType uri funcTerm =
   getFromLocalBindings <|> getFromRef
   where
     getFromRef = do
-      ref <- MaybeT . pure $ refInTermForSigHelp funcTerm
+      ref <- MaybeT . pure $ refInTerm funcTerm
       case ref of
         LD.TermReferent referent ->
           -- Type.Type Symbol Ann needs to be generalized to Context.Type Symbol Ann
@@ -140,16 +140,14 @@ getFuncType uri funcTerm =
 
     getFromLocalBindings = do
       let funcAnn = ABT.annotation funcTerm
-      case annToRange funcAnn of
-        Nothing -> empty
-        Just range -> do
-          FileAnalysis {localBindingInfo} <- FileAnalysis.getFileAnalysis uri
-          let startPos = range ^. start
-          (_interval, (typ, _definitionSite)) <-
-            MaybeT . pure $
-              IM.lookupMin $
-                IM.intersecting localBindingInfo (IM.ClosedInterval startPos startPos)
-          pure typ
+      range <- MaybeT . pure $ annToRange funcAnn
+      FileAnalysis {localBindingInfo} <- FileAnalysis.getFileAnalysis uri
+      let startPos = range ^. start
+      (_interval, (typ, _definitionSite)) <-
+        MaybeT . pure $
+          IM.lookupMin $
+            IM.intersecting localBindingInfo (IM.ClosedInterval startPos startPos)
+      pure typ
 
 -- | Get parameter names from the function definition, if available.
 -- For regular functions, extracts variable names from lambda abstractions.
@@ -159,12 +157,10 @@ getParamNames uri funcTerm = case ABT.out funcTerm of
   ABT.Tm (Term.Constructor conRef@(ConstructorReference typeRef _conId)) ->
     getRecordFieldNames uri typeRef conRef
   _ -> do
-    mayTerm <- runMaybeT $ getTermBody uri funcTerm
-    pure $ case mayTerm of
-      Just t -> case Term.unLams' (peelAnns t) of
-        Just (vs, _body) -> fmap Var.name vs
-        Nothing -> []
-      Nothing -> []
+    fromMaybe [] <$> runMaybeT do
+      t <- getTermBody uri funcTerm
+      (vs, _body) <- MaybeT . pure $ Term.unLams' (peelAnns t)
+      pure $ fmap Var.name vs
 
 -- | Extract field names for a record type constructor.
 -- Records are identified as data declarations with exactly one constructor.
@@ -183,9 +179,8 @@ getRecordFieldNames uri typeRef conRef =
     let getterEntries =
           [ (fieldIdx, fieldName)
           | (sym, (_ann, _ref, trm, _typ)) <- Map.toList termsBySymbol,
-            Just (typeName, fieldName) <- [splitAccessorName sym],
-            isGetterFor conRef typeName trm,
-            Just fieldIdx <- [getterFieldIndex trm]
+            Just (_typeName, fieldName) <- [splitAccessorName sym],
+            Just fieldIdx <- [getterInfo conRef trm]
           ]
     -- Sort by field index and return names in order
     let sorted = map snd $ sortOn fst getterEntries
@@ -202,32 +197,19 @@ splitAccessorName sym =
         _ -> Nothing
 
 -- | Check if a term is a getter accessor for the given constructor reference
--- and type name. A getter has the shape:
+-- and return the field index if so. A getter has the shape:
 --   lam arg -> match arg with Constructor conRef [...] -> ...
-isGetterFor :: ConstructorReference -> Text -> Term Symbol Ann -> Bool
-isGetterFor conRef _typeName trm =
-  case Term.unLams' (peelAnns trm) of
-    Just ([_arg], body) ->
-      case ABT.out body of
-        ABT.Tm (Term.Match _scrutinee [Term.MatchCase pat Nothing _rhs]) ->
-          case pat of
-            Pattern.Constructor _loc patConRef _pats -> patConRef == conRef
-            _ -> False
-        _ -> False
-    _ -> False
-
--- | Extract the field index from a getter accessor body.
--- The getter pattern is Constructor conRef [Unbound, ..., Var, ..., Unbound]
+-- The pattern is Constructor conRef [Unbound, ..., Var, ..., Unbound]
 -- where Var appears at exactly one position (the field index).
-getterFieldIndex :: Term Symbol Ann -> Maybe Int
-getterFieldIndex trm =
+getterInfo :: ConstructorReference -> Term Symbol Ann -> Maybe Int
+getterInfo conRef trm =
   case Term.unLams' (peelAnns trm) of
     Just ([_arg], body) ->
       case ABT.out body of
         ABT.Tm (Term.Match _scrutinee [Term.MatchCase pat Nothing _rhs]) ->
           case pat of
-            Pattern.Constructor _loc _conRef pats ->
-              findIndex isVarPat pats
+            Pattern.Constructor _loc patConRef pats
+              | patConRef == conRef -> findIndex isVarPat pats
             _ -> Nothing
         _ -> Nothing
     _ -> Nothing
@@ -311,15 +293,6 @@ getTypeOfReferent fileUri ref =
       Env {codebase} <- ask
       MaybeT . liftIO $ Codebase.runTransaction codebase $ Codebase.getTypeOfReferent codebase ref
 
--- | Extract a labeled dependency from a term (for the head of a function application).
-refInTermForSigHelp :: Term Symbol Ann -> Maybe LD.LabeledDependency
-refInTermForSigHelp term = case ABT.out term of
-  ABT.Tm f -> case f of
-    Term.Ref ref -> Just (LD.TermReference ref)
-    Term.Constructor conRef -> Just (LD.ConReference conRef CT.Data)
-    Term.Request conRef -> Just (LD.ConReference conRef CT.Effect)
-    _ -> Nothing
-  _ -> Nothing
 
 -- | Find the innermost function application chain where the cursor is on an argument,
 -- returning (function, arguments, active parameter index).
