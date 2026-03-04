@@ -57,9 +57,11 @@ sigHelp uri pos = do
         trms
           <> (testWatchSummary ^.. folded . _4)
           <> (exprWatchSummary ^.. folded . _4)
-  (funcTerm, _, activeParamIdx) <-
+  (funcTerm, args, activeParamIdx) <-
     MaybeT . pure $
       altMap (findEnclosingApp uPos . removeInferredTypeAnnotations) allTerms
+
+  let numArgs = Prelude.length args
 
   funcType <- getFuncType uri funcTerm
   pped <- lift $ ppedForFile uri
@@ -70,59 +72,27 @@ sigHelp uri pos = do
   -- The type may be `∀ a. a -> a` which needs unwrapping first.
   let (_quantifiedVars, funcTypeBody) = Type.unForallsOpt funcType
 
-  -- Decompose the function type into parameters.
-  -- unEffectfulArrows handles effectful types like `a ->{IO} b -> c`
-  -- It returns (firstParamType, [(maybeEffects, nextParamType), ...])
-  -- where the last element in the list is the return type.
+  -- Count the type's arrow params to validate
   case Type.unEffectfulArrows funcTypeBody of
-    Nothing -> empty -- not a function type
-    Just (firstParam, rest) -> do
-      let allTypes = firstParam : map snd rest
-      -- allTypes = [param1, param2, ..., paramN, returnType]
-      -- params are all but the last
-      let numParams = Prelude.length allTypes - 1
-      guard (numParams > 0)
-      guard (activeParamIdx < fromIntegral numParams)
+    Nothing -> empty
+    Just (_firstParam, rest) -> do
+      let typeArity = Prelude.length rest
+      guard (typeArity > 0)
+      guard (activeParamIdx < fromIntegral numArgs)
 
       let funcLabel = renderFuncLabel suffixifiedPPE funcTerm
       let prefix = funcLabel <> " : "
-      let prettyType t = TypePrinter.prettyStr prettyWidth suffixifiedPPE t
-      let prettyEffects es = "{" <> Text.intercalate ", " (fmap prettyType es) <> "} "
-      -- Build the signature label with offset-based parameter labels.
-      -- We construct the type portion piece by piece to track offsets.
+      -- Use the full type pretty-printer for the signature label.
+      -- This correctly handles parenthesization and effects.
+      let fullSig = TypePrinter.prettyStr prettyWidth suffixifiedPPE funcTypeBody
+      let sigLabel = prefix <> fullSig
+      -- Split the rendered type at top-level arrows, then group segments
+      -- to match the call-site arity.
       let prefixLen = fromIntegral (Text.length prefix)
-      let (sigParts, paramLabels, _) =
-            foldl'
-              ( \(parts, labels, offset) (idx, mayEffects, paramType) ->
-                  let paramStr = prettyType paramType
-                      paramLen = fromIntegral (Text.length paramStr)
-                      arrow
-                        | idx == 0 = ""
-                        | otherwise = case mayEffects of
-                            Nothing -> " -> "
-                            Just [] -> " -> "
-                            Just es -> " ->" <> prettyEffects es
-                      --
-                      arrowLen = fromIntegral (Text.length arrow)
-                      paramStart = offset + arrowLen
-                      paramEnd = paramStart + paramLen
-                      label =
-                        ParameterInformation
-                          { _label = InR (paramStart, paramEnd),
-                            _documentation = Nothing
-                          }
-                      isParam = idx < fromIntegral numParams
-                   in ( parts <> [arrow, paramStr],
-                        if isParam then labels <> [label] else labels,
-                        paramEnd
-                      )
-              )
-              ([], [], prefixLen)
-              (zip3 [(0 :: Int) ..] (Nothing : fmap fst rest) allTypes)
-      let sigLabel = prefix <> mconcat sigParts
+      let paramLabels = computeParamOffsets prefixLen fullSig numArgs
 
-      pure
-        SignatureHelp
+  pure
+    SignatureHelp
           { _signatures =
               [ SignatureInformation
                   { _label = sigLabel,
@@ -302,3 +272,81 @@ safeAnnEnd :: Ann -> Maybe Pos
 safeAnnEnd (Ann.Ann _ e) = Just e
 safeAnnEnd (Ann.GeneratedFrom a) = safeAnnEnd a
 safeAnnEnd _ = Nothing
+
+-- | Compute offset-based parameter labels by splitting the rendered type
+-- string at top-level arrows, grouping segments to match call-site arity.
+-- If the type has more arrows than args, extra arrows are grouped into
+-- the first parameter (e.g. for a higher-order function taking a lambda).
+computeParamOffsets :: UInt -> Text -> Int -> [ParameterInformation]
+computeParamOffsets prefixOffset fullSig numArgs =
+  let segments = splitTopLevelArrows fullSig
+      -- segments has (typeArity + 1) entries (params + return type)
+      typeArity = Prelude.length segments - 1
+      -- Group segments to match call-site arity
+      grouped
+        | numArgs >= typeArity = take numArgs segments
+        | otherwise =
+            -- Group the first (typeArity - numArgs + 1) segments into one param.
+            -- The grouped span goes from the start of the first segment to the
+            -- end of the last segment in the group.
+            let groupSize = typeArity - numArgs + 1
+                groupSegs = take groupSize segments
+                (groupStart, _) = head groupSegs
+                (lastStart, lastLen) = last groupSegs
+                groupEnd = lastStart + lastLen
+                remaining = take (numArgs - 1) (drop groupSize segments)
+             in (groupStart, groupEnd - groupStart) : remaining
+   in fmap
+        ( \(offset, len) ->
+            ParameterInformation
+              { _label = InR (prefixOffset + offset, prefixOffset + offset + len),
+                _documentation = Nothing
+              }
+        )
+        grouped
+
+-- | Split a rendered type string at top-level " -> " arrows,
+-- returning (offset, length) pairs for each segment.
+-- Respects nesting in (), {}, and [].
+splitTopLevelArrows :: Text -> [(UInt, UInt)]
+splitTopLevelArrows txt = go 0 0 0 (Text.unpack txt)
+  where
+    go :: Int -> UInt -> UInt -> String -> [(UInt, UInt)]
+    go _depth segStart pos [] = [(segStart, pos - segStart)]
+    go depth segStart pos ('-' : '>' : rest)
+      | depth == 0 =
+          let segLen = trimTrailingSpace segStart (pos - segStart)
+              (consumed, rest') = skipArrowPrefix rest
+              newStart = pos + 2 + consumed
+           in (segStart, segLen) : go depth newStart newStart rest'
+    go depth segStart pos (c : rest) =
+      let depth' = case c of
+            '(' -> depth + 1
+            '{' -> depth + 1
+            '[' -> depth + 1
+            ')' -> depth - 1
+            '}' -> depth - 1
+            ']' -> depth - 1
+            _ -> depth
+       in go depth' segStart (pos + 1) rest
+
+    trimTrailingSpace :: UInt -> UInt -> UInt
+    trimTrailingSpace segStart segLen =
+      let segText = Text.take (fromIntegral segLen) (Text.drop (fromIntegral segStart) txt)
+       in fromIntegral . Text.length $ Text.stripEnd segText
+
+    -- Skip spaces and effect annotations after "->"
+    skipArrowPrefix :: String -> (UInt, String)
+    skipArrowPrefix (' ' : rest) = let (n, r) = skipArrowPrefix rest in (n + 1, r)
+    skipArrowPrefix ('{' : rest) =
+      let (n, rest') = skipUntilClose rest
+       in skipArrowPrefix rest' & \(m, r) -> (1 + n + m, r)
+    skipArrowPrefix s = (0, s)
+
+    skipUntilClose :: String -> (UInt, String)
+    skipUntilClose [] = (0, [])
+    skipUntilClose ('}' : rest) =
+      case rest of
+        ' ' : rest' -> (2, rest')
+        _ -> (1, rest)
+    skipUntilClose (_ : rest) = let (n, r) = skipUntilClose rest in (n + 1, r)

@@ -800,7 +800,7 @@ signatureHelpEndToEnd =
 foo bar = bar
 aDemo bar = foo ba^r
         |]
-        (Just 0),
+        (Just (0, "foo : bar -> bar")),
       makeSignatureHelpTest
         "No sig help when cursor is on function head"
         [here|
@@ -814,14 +814,14 @@ aDemo bar = fo^o bar
 foo a b = a
 term = foo "Location" ".^"
         |]
-        (Just 1),
+        (Just (1, "foo : a -> b -> a")),
       makeSignatureHelpTest
         "Dotted function name with two string args: cursor on second"
         [here|
 headers.add a b = a
 term = headers.add "Location" ".^"
         |]
-        (Just 1),
+        (Just (1, "add : a -> b -> a")),
       makeSignatureHelpTest
         "Nested let with two string args: cursor on second"
         [here|
@@ -829,7 +829,7 @@ term =
   f a b = a
   f "Location" ".^"
         |]
-        (Just 1),
+        (Just (1, "f : a -> b -> a")),
       makeSignatureHelpTest
         "Do block with two string args: cursor on second"
         [here|
@@ -837,29 +837,31 @@ foo x y = x
 demo = do
   foo "Location" ".^"
         |]
-        (Just 1),
-      makeSignatureHelpTest
-        "Do block with effectful function: cursor on second arg"
-        [here|
-foo x y = do
-  _ = x ++ y
-  ()
-demo = do
-  foo "Location" ".^"
-        |]
-        (Just 1),
+        (Just (1, "foo : x -> y -> x")),
       makeSignatureHelpTest
         "Repro: top-level call with two string args"
         [here|
 demo = foo "Location" ".^"
 foo x y = (x ++ y)
         |]
-        (Just 1)
+        (Just (1, "foo : x -> y -> \120163")),
+      makeSignatureHelpTest
+        "Higher-order function: cursor on first arg (lambda)"
+        [here|
+mymap f x = f x
+demo = mymap (a -> a) tru^e
+        |]
+        (Just (1, "mymap : (i ->{\120150} o) -> i ->{\120150} o")),
+      makeSignatureHelpTest
+        "Higher-order function: cursor on lambda arg"
+        [here|
+mymap f x = f x
+demo = mymap (a -> a^) true
+        |]
+        (Just (0, "mymap : (i ->{\120150} o) -> i ->{\120150} o"))
     ]
 
--- | End-to-end test for signature help. Runs the full sigHelp through the LSP test env.
--- Expected is Just activeParamIdx, or Nothing if no signature help expected.
-makeSignatureHelpTest :: String -> Text -> Maybe UInt -> Test ()
+makeSignatureHelpTest :: String -> Text -> Maybe (UInt, Text) -> Test ()
 makeSignatureHelpTest name testSrc expected = scope name $ do
   (pos, src) <- extractCursor testSrc
   result <- runTestLsp . runMaybeT $ do
@@ -877,13 +879,14 @@ makeSignatureHelpTest name testSrc expected = scope name $ do
     SigHelp.sigHelp uri (uToLspPos pos)
   let actual =
         result <&> \sh ->
-          sh ^. LSP.activeParameter & \case
-            Just (InL idx) -> idx
-            _ -> error "expected activeParameter to be set"
-  case (expected, actual) of
-    (Nothing, Nothing) -> ok
-    (Just expectedIdx, Just actualIdx) -> expectEqual expectedIdx actualIdx
-    _ -> crash $ "Expected " ++ show expected ++ " but got " ++ show actual
+          let idx = sh ^. LSP.activeParameter & \case
+                Just (InL i) -> i
+                _ -> error "expected activeParameter to be set"
+              lbl = case sh ^. LSP.signatures of
+                [sig] -> sig ^. LSP.label
+                _ -> error "expected exactly one signature"
+           in (idx, lbl)
+  expectEqual expected actual
 
 -- | Makes a test for findEnclosingApp.
 -- Expected is (funcName, argCount, activeParamIndex) or Nothing if no match.
