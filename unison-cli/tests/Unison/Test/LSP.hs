@@ -896,7 +896,14 @@ greet : Greeting -> Name -> (Greeting, Name)
 greet msg who = (msg, who)
 demo = greet Greeting Na^me
         |]
-        (Just (1, "greet : Greeting -> Name -> (Greeting, Name)", [Just "msg : Greeting", Just "who : Name"]))
+        (Just (1, "greet : Greeting -> Name -> (Greeting, Name)", [Just "msg : Greeting", Just "who : Name"])),
+      makeSignatureHelpTest
+        "Record constructor field names"
+        [here|
+type Request = { method : Text, id : Nat }
+demo = Request "foo" 4^2
+        |]
+        (Just (1, "Request : Text -> Nat -> Request", [Just "method : Text", Just "id : Nat"]))
     ]
 
 makeSignatureHelpTest :: String -> Text -> Maybe (UInt, Text, [Maybe Text]) -> Test ()

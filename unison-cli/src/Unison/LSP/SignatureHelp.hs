@@ -5,6 +5,7 @@ import Control.Monad.Reader
 import Data.Char (ord)
 import Data.IntervalMap.Lazy qualified as IM
 import Data.List (findIndex)
+import Data.List.NonEmpty (pattern (:|))
 import Data.Map.Strict qualified as Map
 import Data.Text qualified as Text
 import Language.LSP.Protocol.Lens
@@ -12,7 +13,9 @@ import Language.LSP.Protocol.Message qualified as Msg
 import Language.LSP.Protocol.Types
 import Unison.ABT qualified as ABT
 import Unison.Codebase qualified as Codebase
+import Unison.ConstructorReference (ConstructorReference, GConstructorReference (..))
 import Unison.ConstructorType qualified as CT
+import Unison.DataDeclaration qualified as DD
 import Unison.HashQualified qualified as HQ
 import Unison.LSP.Conversions (annToRange, lspToUPos)
 import Unison.LSP.FileAnalysis (getFileSummary, ppedForFile)
@@ -21,15 +24,18 @@ import Unison.LSP.Queries (removeInferredTypeAnnotations)
 import Unison.LSP.Types
 import Unison.LabeledDependency qualified as LD
 import Unison.Lexer.Pos (Pos)
+import Unison.Name qualified as Name
+import Unison.NameSegment qualified as NameSegment
 import Unison.Parser.Ann (Ann)
 import Unison.Parser.Ann qualified as Ann
+import Unison.Pattern qualified as Pattern
 import Unison.Prelude
 import Unison.PrettyPrintEnv qualified as PPE
 import Unison.PrettyPrintEnvDecl qualified as PPED
 import Unison.Reference qualified as Reference
 import Unison.Referent qualified as Referent
 import Unison.Symbol (Symbol)
-import Unison.Syntax.Name qualified as Name
+import Unison.Syntax.Name qualified as SName
 import Unison.Syntax.TypePrinter qualified as TypePrinter
 import Unison.Term (Term)
 import Unison.Term qualified as Term
@@ -112,9 +118,9 @@ renderFuncLabel :: PPE.PrettyPrintEnv -> Term Symbol Ann -> Text
 renderFuncLabel ppe term = case ABT.out term of
   ABT.Var v -> Var.name v
   ABT.Tm f -> case f of
-    Term.Ref ref -> HQ.toTextWith Name.toText $ PPE.termName ppe (Referent.Ref ref)
-    Term.Constructor conRef -> HQ.toTextWith Name.toText $ PPE.termName ppe (Referent.Con conRef CT.Data)
-    Term.Request conRef -> HQ.toTextWith Name.toText $ PPE.termName ppe (Referent.Con conRef CT.Effect)
+    Term.Ref ref -> HQ.toTextWith SName.toText $ PPE.termName ppe (Referent.Ref ref)
+    Term.Constructor conRef -> HQ.toTextWith SName.toText $ PPE.termName ppe (Referent.Con conRef CT.Data)
+    Term.Request conRef -> HQ.toTextWith SName.toText $ PPE.termName ppe (Referent.Con conRef CT.Effect)
     _ -> "fn"
   _ -> "fn"
 
@@ -146,15 +152,106 @@ getFuncType uri funcTerm =
           pure typ
 
 -- | Get parameter names from the function definition, if available.
--- Extracts variable names from the lambda abstractions of the term body.
+-- For regular functions, extracts variable names from lambda abstractions.
+-- For record constructors, extracts field names from generated accessor terms.
 getParamNames :: (Lspish m, MonadUnliftIO m) => Uri -> Term Symbol Ann -> m [Text]
-getParamNames uri funcTerm = do
-  mayTerm <- runMaybeT $ getTermBody uri funcTerm
-  pure $ case mayTerm of
-    Just t -> case Term.unLams' (peelAnns t) of
-      Just (vs, _body) -> fmap Var.name vs
+getParamNames uri funcTerm = case ABT.out funcTerm of
+  ABT.Tm (Term.Constructor conRef@(ConstructorReference typeRef _conId)) ->
+    getRecordFieldNames uri typeRef conRef
+  _ -> do
+    mayTerm <- runMaybeT $ getTermBody uri funcTerm
+    pure $ case mayTerm of
+      Just t -> case Term.unLams' (peelAnns t) of
+        Just (vs, _body) -> fmap Var.name vs
+        Nothing -> []
       Nothing -> []
-    Nothing -> []
+
+-- | Extract field names for a record type constructor.
+-- Records are identified as data declarations with exactly one constructor.
+-- Field names are recovered from the generated accessor terms in the file.
+getRecordFieldNames :: (Lspish m, MonadUnliftIO m) => Uri -> Reference.TypeReference -> ConstructorReference -> m [Text]
+getRecordFieldNames uri typeRef conRef = fromMaybe [] <$> runMaybeT do
+  -- Look up the data declaration
+  dd <- getDataDeclaration uri typeRef
+  -- Records have exactly one constructor
+  guard (DD.constructorCount dd == 1)
+  -- Get accessor terms from the file
+  FileSummary {termsBySymbol} <- getFileSummary uri
+  -- Collect getter terms: those whose name matches TypeName.fieldName
+  -- and whose body is a record getter (match with Var at exactly one position)
+  let getterEntries =
+        [ (fieldIdx, fieldName)
+        | (sym, (_ann, _ref, trm, _typ)) <- Map.toList termsBySymbol,
+          Just (typeName, fieldName) <- [splitAccessorName sym],
+          isGetterFor conRef typeName trm,
+          Just fieldIdx <- [getterFieldIndex trm]
+        ]
+  -- Sort by field index and return names in order
+  let sorted = map snd $ sortOn fst getterEntries
+  guard (not $ null sorted)
+  pure sorted
+
+-- | Split a symbol name like "Request.method" into (typeName, fieldName).
+-- Returns Nothing if the name doesn't have exactly two segments.
+splitAccessorName :: Symbol -> Maybe (Text, Text)
+splitAccessorName sym =
+  let n = SName.unsafeParseVar sym
+   in case Name.segments n of
+        (s1 :| [s2]) -> Just (NameSegment.toUnescapedText s1, NameSegment.toUnescapedText s2)
+        _ -> Nothing
+
+-- | Check if a term is a getter accessor for the given constructor reference
+-- and type name. A getter has the shape:
+--   lam arg -> match arg with Constructor conRef [...] -> ...
+isGetterFor :: ConstructorReference -> Text -> Term Symbol Ann -> Bool
+isGetterFor conRef _typeName trm =
+  case Term.unLams' (peelAnns trm) of
+    Just ([_arg], body) ->
+      case ABT.out body of
+        ABT.Tm (Term.Match _scrutinee [Term.MatchCase pat Nothing _rhs]) ->
+          case pat of
+            Pattern.Constructor _loc patConRef _pats -> patConRef == conRef
+            _ -> False
+        _ -> False
+    _ -> False
+
+-- | Extract the field index from a getter accessor body.
+-- The getter pattern is Constructor conRef [Unbound, ..., Var, ..., Unbound]
+-- where Var appears at exactly one position (the field index).
+getterFieldIndex :: Term Symbol Ann -> Maybe Int
+getterFieldIndex trm =
+  case Term.unLams' (peelAnns trm) of
+    Just ([_arg], body) ->
+      case ABT.out body of
+        ABT.Tm (Term.Match _scrutinee [Term.MatchCase pat Nothing _rhs]) ->
+          case pat of
+            Pattern.Constructor _loc _conRef pats ->
+              findIndex isVarPat pats
+            _ -> Nothing
+        _ -> Nothing
+    _ -> Nothing
+  where
+    isVarPat (Pattern.Var _) = True
+    isVarPat _ = False
+
+-- | Look up a DataDeclaration from the file summary or codebase.
+getDataDeclaration :: (Lspish m, MonadUnliftIO m) => Uri -> Reference.TypeReference -> MaybeT m (DD.DataDeclaration Symbol Ann)
+getDataDeclaration uri typeRef = getFromFile <|> getFromCodebase
+  where
+    getFromFile = do
+      refId <- MaybeT . pure $ Reference.toId typeRef
+      FileSummary {dataDeclsByReference} <- getFileSummary uri
+      MaybeT . pure $ do
+        symMap <- Map.lookup refId dataDeclsByReference
+        -- Take any entry (there should be only one)
+        listToMaybe (Map.elems symMap)
+    getFromCodebase = do
+      refId <- MaybeT . pure $ Reference.toId typeRef
+      Env {codebase} <- ask
+      decl <- MaybeT . liftIO $ Codebase.runTransaction codebase $ Codebase.getTypeDeclaration codebase refId
+      case decl of
+        Right dd -> pure dd
+        Left ed -> pure (DD.toDataDecl ed)
 
 -- | Get the term body for a function, looking in the file first, then the codebase.
 getTermBody :: (Lspish m, MonadUnliftIO m) => Uri -> Term Symbol Ann -> MaybeT m (Term Symbol Ann)
@@ -248,7 +345,7 @@ findEnclosingApp pos term =
             let activeParam = findActiveParam pos args
             Just (func, args, activeParam)
       _ -> Nothing
-
+    --
     findInChildren :: Maybe (Term Symbol Ann, [Term Symbol Ann], UInt)
     findInChildren = case ABT.out term of
       ABT.Tm f -> case f of
@@ -363,20 +460,24 @@ buildSignatureLabel prefix fullSig numArgs paramNames =
       -- Compute UTF-16 offsets for each plain param chunk
       prefixU16 = utf16Length prefix
       allSepArrows = paramSepArrows <> [lastArrow]
-      paramInfos = snd $ foldl'
-        (\(curOffset, acc) (seg, doc, idx) ->
-          let segU16 = utf16Length seg
-              arrowU16 = if idx < Prelude.length allSepArrows
-                         then utf16Length (allSepArrows !! idx)
-                         else 0
-              info = ParameterInformation
-                { _label = InR (curOffset, curOffset + segU16),
-                  _documentation = doc
-                }
-           in (curOffset + segU16 + arrowU16, acc <> [info])
-        )
-        (prefixU16, [])
-        (zip3 chunkTexts docs [0 :: Int ..])
+      paramInfos =
+        snd $
+          foldl'
+            ( \(curOffset, acc) (seg, doc, idx) ->
+                let segU16 = utf16Length seg
+                    arrowU16 =
+                      if idx < Prelude.length allSepArrows
+                        then utf16Length (allSepArrows !! idx)
+                        else 0
+                    info =
+                      ParameterInformation
+                        { _label = InR (curOffset, curOffset + segU16),
+                          _documentation = doc
+                        }
+                 in (curOffset + segU16 + arrowU16, acc <> [info])
+            )
+            (prefixU16, [])
+            (zip3 chunkTexts docs [0 :: Int ..])
    in (sigLabel, paramInfos)
   where
     mkDoc :: (Maybe Text, Text) -> Maybe (Text |? MarkupContent)
