@@ -3,6 +3,7 @@ module Unison.LSP.SignatureHelp where
 import Control.Lens hiding (List)
 import Control.Monad.Reader
 import Data.IntervalMap.Lazy qualified as IM
+import Data.Char (ord)
 import Data.List (findIndex)
 import Data.Text qualified as Text
 import Language.LSP.Protocol.Lens
@@ -88,11 +89,10 @@ sigHelp uri pos = do
       let sigLabel = prefix <> fullSig
       -- Split the rendered type at top-level arrows, then group segments
       -- to match the call-site arity.
-      let prefixLen = fromIntegral (Text.length prefix)
-      let paramLabels = computeParamOffsets prefixLen fullSig numArgs
+      let paramLabels = computeParamOffsets prefix fullSig numArgs
 
-  pure
-    SignatureHelp
+      pure
+        SignatureHelp
           { _signatures =
               [ SignatureInformation
                   { _label = sigLabel,
@@ -277,8 +277,9 @@ safeAnnEnd _ = Nothing
 -- string at top-level arrows, grouping segments to match call-site arity.
 -- If the type has more arrows than args, extra arrows are grouped into
 -- the first parameter (e.g. for a higher-order function taking a lambda).
-computeParamOffsets :: UInt -> Text -> Int -> [ParameterInformation]
-computeParamOffsets prefixOffset fullSig numArgs =
+-- Returns labels with UTF-16 offsets as required by the LSP spec.
+computeParamOffsets :: Text -> Text -> Int -> [ParameterInformation]
+computeParamOffsets prefix fullSig numArgs =
   let segments = splitTopLevelArrows fullSig
       -- segments has (typeArity + 1) entries (params + return type)
       typeArity = Prelude.length segments - 1
@@ -291,22 +292,34 @@ computeParamOffsets prefixOffset fullSig numArgs =
             -- end of the last segment in the group.
             let groupSize = typeArity - numArgs + 1
                 groupSegs = take groupSize segments
-                (groupStart, _) = head groupSegs
-                (lastStart, lastLen) = last groupSegs
-                groupEnd = lastStart + lastLen
                 remaining = take (numArgs - 1) (drop groupSize segments)
-             in (groupStart, groupEnd - groupStart) : remaining
+             in case (groupSegs, reverse groupSegs) of
+                  ((groupStart, _) : _, (lastStart, lastLen) : _) ->
+                    let groupEnd = lastStart + lastLen
+                     in (groupStart, groupEnd - groupStart) : remaining
+                  _ -> segments
+      -- Convert codepoint-based (offset, len) to UTF-16 (start, end) offsets.
+      -- The full label is prefix <> fullSig, so we convert offsets within
+      -- fullSig by adding the UTF-16 length of the prefix.
+      prefixU16 = utf16Length prefix
+      sigChars = Text.unpack fullSig
+      -- Build a mapping from codepoint index to UTF-16 offset within fullSig
+      cpToU16 cpIdx = foldl' (\acc c -> acc + utf16Width c) 0 (take (fromIntegral cpIdx) sigChars)
    in fmap
-        ( \(offset, len) ->
-            ParameterInformation
-              { _label = InR (prefixOffset + offset, prefixOffset + offset + len),
-                _documentation = Nothing
-              }
+        ( \(cpOff, cpLen) ->
+            let u16Start = prefixU16 + cpToU16 cpOff
+                u16End = prefixU16 + cpToU16 (cpOff + cpLen)
+             in ParameterInformation
+                  { _label = InR (u16Start, u16End),
+                    _documentation = Nothing
+                  }
         )
         grouped
 
 -- | Split a rendered type string at top-level " -> " arrows,
 -- returning (offset, length) pairs for each segment.
+-- All offsets are in codepoints (Haskell Char indices).
+-- Use 'cpToUtf16' to convert to UTF-16 offsets for LSP.
 -- Respects nesting in (), {}, and [].
 splitTopLevelArrows :: Text -> [(UInt, UInt)]
 splitTopLevelArrows txt = go 0 0 0 (Text.unpack txt)
@@ -350,3 +363,15 @@ splitTopLevelArrows txt = go 0 0 0 (Text.unpack txt)
         ' ' : rest' -> (2, rest')
         _ -> (1, rest)
     skipUntilClose (_ : rest) = let (n, r) = skipUntilClose rest in (n + 1, r)
+
+-- | Number of UTF-16 code units for a single Char.
+-- Characters in the Basic Multilingual Plane (U+0000..U+FFFF) take 1 unit,
+-- supplementary characters (U+10000+) take 2 (surrogate pair).
+utf16Width :: Char -> UInt
+utf16Width c
+  | ord c < 0x10000 = 1
+  | otherwise = 2
+
+-- | Compute UTF-16 code unit length of a Text.
+utf16Length :: Text -> UInt
+utf16Length = Text.foldl' (\n c -> n + utf16Width c) 0

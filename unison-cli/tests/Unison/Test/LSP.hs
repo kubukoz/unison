@@ -858,7 +858,35 @@ demo = mymap (a -> a) tru^e
 mymap f x = f x
 demo = mymap (a -> a^) true
         |]
-        (Just (0, "mymap : (i ->{\120150} o) -> i ->{\120150} o"))
+        (Just (0, "mymap : (i ->{\120150} o) -> i ->{\120150} o")),
+      makeSignatureHelpTest
+        "Higher-order function with 3 type arrows, 2 args: cursor on second"
+        [here|
+mymap f x = f x
+demo = mymap (a -> a) tru^e
+        |]
+        (Just (1, "mymap : (i ->{\120150} o) -> i ->{\120150} o")),
+      makeSignatureHelpTest
+        "Three-arg function: cursor on third"
+        [here|
+foo a b c = a
+demo = foo 1 2 ^3
+        |]
+        (Just (2, "foo : a -> b -> c -> a")),
+      makeSignatureHelpTest
+        "Effectful two-arg function: cursor on first"
+        [here|
+foo a b = !b
+demo = foo ^1 '2
+        |]
+        (Just (0, "foo : a -> '{\120150} \120169 ->{\120150} \120169")),
+      makeSignatureHelpTest
+        "Effectful two-arg function: cursor on second"
+        [here|
+foo a b = !b
+demo = foo 1 '^2
+        |]
+        (Just (1, "foo : a -> '{\120150} \120169 ->{\120150} \120169"))
     ]
 
 makeSignatureHelpTest :: String -> Text -> Maybe (UInt, Text) -> Test ()
