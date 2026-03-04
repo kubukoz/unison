@@ -155,6 +155,7 @@ library
       Unison.LSP.Orphans
       Unison.LSP.ProjectContext
       Unison.LSP.Queries
+      Unison.LSP.SignatureHelp
       Unison.LSP.Types
       Unison.LSP.UCMWorker
       Unison.LSP.Util.IntersectionMap

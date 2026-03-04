@@ -1,0 +1,250 @@
+module Unison.LSP.SignatureHelp where
+
+import Control.Lens hiding (List)
+import Control.Monad.Reader
+import Data.IntervalMap.Lazy qualified as IM
+import Data.List (findIndex)
+import Language.LSP.Protocol.Lens
+import Language.LSP.Protocol.Message qualified as Msg
+import Language.LSP.Protocol.Types
+import Unison.ABT qualified as ABT
+import Unison.Codebase qualified as Codebase
+import Unison.ConstructorType qualified as CT
+import Unison.LSP.Conversions (annToRange, lspToUPos)
+import Unison.LSP.FileAnalysis (getFileSummary, ppedForFile)
+import Unison.LSP.FileAnalysis qualified as FileAnalysis
+import Unison.LSP.Queries (removeInferredTypeAnnotations)
+import Unison.LSP.Types
+import Unison.LabeledDependency qualified as LD
+import Unison.Lexer.Pos (Pos)
+import Unison.Parser.Ann (Ann)
+import Unison.Parser.Ann qualified as Ann
+import Unison.Prelude
+import Unison.PrettyPrintEnvDecl qualified as PPED
+import Unison.Reference qualified as Reference
+import Unison.Referent qualified as Referent
+import Unison.Symbol (Symbol)
+import Unison.Syntax.TypePrinter qualified as TypePrinter
+import Unison.Term (Term)
+import Unison.Term qualified as Term
+import Unison.Type qualified as Type
+import Unison.Typechecker.Context qualified as Context
+import Unison.Typechecker.TypeVar qualified as TypeVar
+import Unison.UnisonFile.Summary (FileSummary (..))
+import Unison.Util.Pretty qualified as Pretty
+
+signatureHelpHandler ::
+  Msg.TRequestMessage 'Msg.Method_TextDocumentSignatureHelp ->
+  (Either (Msg.TResponseError 'Msg.Method_TextDocumentSignatureHelp) (Msg.MessageResult 'Msg.Method_TextDocumentSignatureHelp) -> Lsp ()) ->
+  Lsp ()
+signatureHelpHandler m respond =
+  respond . Right . maybe (InR Null) InL =<< runMaybeT do
+    let pos = m ^. params . position
+    let fileUri = m ^. params . textDocument . uri
+    sigHelp fileUri pos
+
+sigHelp :: (Lspish m, MonadUnliftIO m) => Uri -> Position -> MaybeT m SignatureHelp
+sigHelp uri pos = do
+  let uPos = lspToUPos pos
+  (FileSummary {termsBySymbol, testWatchSummary, exprWatchSummary}) <- getFileSummary uri
+  let trms = termsBySymbol & foldMap \(_ann, _ref, trm, _mayTyp) -> [trm]
+  let allTerms =
+        trms
+          <> (testWatchSummary ^.. folded . _4)
+          <> (exprWatchSummary ^.. folded . _4)
+  (funcTerm, _, activeParamIdx) <-
+    MaybeT . pure $
+      altMap (findEnclosingApp uPos . removeInferredTypeAnnotations) allTerms
+
+  funcType <- getFuncType uri funcTerm
+  pped <- lift $ ppedForFile uri
+  let suffixifiedPPE = PPED.suffixifiedPPE pped
+  let prettyWidth = Pretty.Width 40
+
+  -- Decompose the function type into parameters.
+  -- unEffectfulArrows handles effectful types like `a ->{IO} b -> c`
+  -- It returns (firstParamType, [(maybeEffects, nextParamType), ...])
+  -- where the last element in the list is the return type.
+  case Type.unEffectfulArrows funcType of
+    Nothing -> empty -- not a function type
+    Just (firstParam, rest) -> do
+      let allTypes = firstParam : map snd rest
+      -- allTypes = [param1, param2, ..., paramN, returnType]
+      -- params are all but the last
+      let numParams = Prelude.length allTypes - 1
+      guard (numParams > 0)
+      guard (activeParamIdx < fromIntegral numParams)
+
+      let paramLabels =
+            take numParams allTypes <&> \paramType ->
+              ParameterInformation
+                { _label = InL (TypePrinter.prettyStr prettyWidth suffixifiedPPE paramType),
+                  _documentation = Nothing
+                }
+
+      let fullSig = TypePrinter.prettyStr prettyWidth suffixifiedPPE funcType
+      let funcLabel = renderFuncLabel funcTerm
+      let sigLabel = funcLabel <> " : " <> fullSig
+
+      pure
+        SignatureHelp
+          { _signatures =
+              [ SignatureInformation
+                  { _label = sigLabel,
+                    _documentation = Nothing,
+                    _parameters = Just paramLabels,
+                    _activeParameter = Just (InL activeParamIdx)
+                  }
+              ],
+            _activeSignature = Just 0,
+            _activeParameter = Just (InL activeParamIdx)
+          }
+
+-- | Get a short label for the function being called.
+renderFuncLabel :: Term Symbol Ann -> Text
+renderFuncLabel term = case ABT.out term of
+  ABT.Var v -> tShow v
+  ABT.Tm f -> case f of
+    Term.Ref ref -> tShow ref
+    Term.Constructor conRef -> tShow conRef
+    Term.Request conRef -> tShow conRef
+    _ -> "fn"
+  _ -> "fn"
+
+-- | Get the type of a function term.
+-- Returns a Context.Type which uses TypeVar variables (from the typechecker).
+getFuncType :: (Lspish m, MonadUnliftIO m) => Uri -> Term Symbol Ann -> MaybeT m (Context.Type Symbol Ann)
+getFuncType uri funcTerm =
+  getFromLocalBindings <|> getFromRef
+  where
+    getFromRef = do
+      ref <- MaybeT . pure $ refInTermForSigHelp funcTerm
+      case ref of
+        LD.TermReferent referent ->
+          -- Type.Type Symbol Ann needs to be generalized to Context.Type Symbol Ann
+          generalize <$> getTypeOfReferent uri referent
+        LD.TypeReference _typeRef -> empty
+
+    getFromLocalBindings = do
+      let funcAnn = ABT.annotation funcTerm
+      case annToRange funcAnn of
+        Nothing -> empty
+        Just range -> do
+          FileAnalysis {localBindingInfo} <- FileAnalysis.getFileAnalysis uri
+          let startPos = range ^. start
+          (_interval, (typ, _definitionSite)) <-
+            MaybeT . pure $
+              IM.lookupMin $
+                IM.intersecting localBindingInfo (IM.ClosedInterval startPos startPos)
+          pure typ
+
+-- | Generalize a Type from plain Symbol variables to TypeVar variables.
+generalize :: Type.Type Symbol Ann -> Context.Type Symbol Ann
+generalize = ABT.vmap TypeVar.Universal
+
+-- | Gets the type of a referent from either the parsed file or the codebase.
+getTypeOfReferent :: (Lspish m) => Uri -> Referent.Referent -> MaybeT m (Type.Type Symbol Ann)
+getTypeOfReferent fileUri ref =
+  getFromFile <|> getFromCodebase
+  where
+    getFromFile = do
+      FileSummary {termsByReference} <- getFileSummary fileUri
+      case ref of
+        Referent.Ref (Reference.Builtin {}) -> empty
+        Referent.Ref (Reference.DerivedId termRefId) ->
+          MaybeT . pure $ (termsByReference ^? ix (Just termRefId) . folded . _3 . _Just)
+        Referent.Con {} -> empty
+    getFromCodebase = do
+      Env {codebase} <- ask
+      MaybeT . liftIO $ Codebase.runTransaction codebase $ Codebase.getTypeOfReferent codebase ref
+
+-- | Extract a labeled dependency from a term (for the head of a function application).
+refInTermForSigHelp :: Term Symbol Ann -> Maybe LD.LabeledDependency
+refInTermForSigHelp term = case ABT.out term of
+  ABT.Tm f -> case f of
+    Term.Ref ref -> Just (LD.TermReference ref)
+    Term.Constructor conRef -> Just (LD.ConReference conRef CT.Data)
+    Term.Request conRef -> Just (LD.ConReference conRef CT.Effect)
+    _ -> Nothing
+  _ -> Nothing
+
+-- | Find the innermost function application chain that contains the given position,
+-- returning (function, arguments, active parameter index).
+--
+-- For a call like `f a b c` with cursor on `b`, returns `(f, [a, b, c], 1)`.
+-- If the cursor is past the last argument but still within the application span,
+-- the active parameter index is set to the number of arguments (pointing at the next param).
+findEnclosingApp :: Pos -> Term Symbol Ann -> Maybe (Term Symbol Ann, [Term Symbol Ann], UInt)
+findEnclosingApp pos term =
+  -- Try to find the deepest/innermost application first
+  findInChildren <|> findHere
+  where
+    termAnn = ABT.annotation term
+
+    findHere :: Maybe (Term Symbol Ann, [Term Symbol Ann], UInt)
+    findHere = case ABT.out term of
+      ABT.Tm (Term.App _ _)
+        | termAnn `Ann.contains` pos -> do
+            let (func, args) = collectApps term
+            let activeParam = findActiveParam pos args
+            Just (func, args, activeParam)
+      _ -> Nothing
+
+    findInChildren :: Maybe (Term Symbol Ann, [Term Symbol Ann], UInt)
+    findInChildren = case ABT.out term of
+      ABT.Tm f -> case f of
+        Term.App a b -> findEnclosingApp pos b <|> findEnclosingApp pos a
+        Term.Handle a b -> findEnclosingApp pos a <|> findEnclosingApp pos b
+        Term.Ann a _typ -> findEnclosingApp pos a
+        Term.List xs -> altSum (findEnclosingApp pos <$> xs)
+        Term.If cond a b -> findEnclosingApp pos cond <|> findEnclosingApp pos a <|> findEnclosingApp pos b
+        Term.And l r -> findEnclosingApp pos l <|> findEnclosingApp pos r
+        Term.Or l r -> findEnclosingApp pos l <|> findEnclosingApp pos r
+        Term.Lam a -> findEnclosingApp pos a
+        Term.LetRec _isTop xs y ->
+          altSum (findEnclosingApp pos <$> xs) <|> findEnclosingApp pos y
+        Term.Let _isTop a b ->
+          findEnclosingApp pos a <|> findEnclosingApp pos b
+        Term.Match a cases ->
+          findEnclosingApp pos a
+            <|> altSum
+              ( cases <&> \(Term.MatchCase _pat grd body) ->
+                  (grd >>= findEnclosingApp pos) <|> findEnclosingApp pos body
+              )
+        _ -> Nothing
+      ABT.Var {} -> Nothing
+      ABT.Cycle r -> findEnclosingApp pos r
+      ABT.Abs _v r -> findEnclosingApp pos r
+
+-- | Collect the function and all arguments from a chain of App nodes.
+-- `f a b c` is represented as `App (App (App f a) b) c`
+-- This returns `(f, [a, b, c])`.
+collectApps :: Term Symbol Ann -> (Term Symbol Ann, [Term Symbol Ann])
+collectApps = go []
+  where
+    go args (Term.App' f x) = go (x : args) f
+    go args f = (f, args)
+
+-- | Determine which parameter is active based on cursor position.
+-- Returns the 0-indexed parameter index.
+findActiveParam :: Pos -> [Term Symbol Ann] -> UInt
+findActiveParam pos args =
+  case findIndex (\arg -> ABT.annotation arg `Ann.contains` pos) args of
+    Just idx -> fromIntegral idx
+    Nothing ->
+      -- Cursor is not directly on any argument (between args or after last).
+      -- Count how many args end before or at the cursor position.
+      let numArgsBefore = Prelude.length $ filter (argEndsBefore pos) args
+       in fromIntegral numArgsBefore
+
+-- | Check if an argument's annotation ends before the given position.
+argEndsBefore :: Pos -> Term Symbol Ann -> Bool
+argEndsBefore pos arg = case safeAnnEnd (ABT.annotation arg) of
+  Nothing -> False
+  Just endPos -> endPos <= pos
+
+-- | Safely extract the end position from an Ann.
+safeAnnEnd :: Ann -> Maybe Pos
+safeAnnEnd (Ann.Ann _ e) = Just e
+safeAnnEnd (Ann.GeneratedFrom a) = safeAnnEnd a
+safeAnnEnd _ = Nothing

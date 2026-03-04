@@ -17,6 +17,7 @@ module Unison.LSP.Queries
     findSmallestEnclosingPattern,
     findSmallestEnclosingPatternMatching,
     refInDecl,
+    removeInferredTypeAnnotations,
     SourceNode (..),
   )
 where

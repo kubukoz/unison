@@ -45,6 +45,7 @@ import Unison.LSP.Formatting (formatDocRequest, formatRangeRequest)
 import Unison.LSP.GoToDefinition (goToDeclarationHandler, goToDefinitionHandler, goToImplementationHandler)
 import Unison.LSP.HandlerUtils qualified as Handlers
 import Unison.LSP.Hover (hoverHandler)
+import Unison.LSP.SignatureHelp (signatureHelpHandler)
 import Unison.LSP.NotificationHandlers qualified as Notifications
 import Unison.LSP.OpenOnShare (openOnShareHandler)
 import Unison.LSP.Orphans ()
@@ -182,6 +183,7 @@ lspRequestHandlers :: LspFormattingConfig -> SMethodMap (ClientMessageHandler Ls
 lspRequestHandlers lspFormattingConfig =
   mempty
     & SMM.insert Msg.SMethod_TextDocumentHover (mkHandler hoverHandler)
+    & SMM.insert Msg.SMethod_TextDocumentSignatureHelp (mkHandler signatureHelpHandler)
     & SMM.insert Msg.SMethod_TextDocumentCodeAction (mkHandler codeActionHandler)
     & SMM.insert Msg.SMethod_TextDocumentCodeLens (mkHandler codeLensHandler)
     & SMM.insert Msg.SMethod_WorkspaceExecuteCommand (mkHandler executeCommandHandler)
