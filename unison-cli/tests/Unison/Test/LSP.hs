@@ -12,6 +12,7 @@ import Data.Text hiding (show)
 import Data.Text qualified as Text
 import EasyTest
 import Language.LSP.Protocol.Lens qualified as LSP
+import Language.LSP.Protocol.Types (UInt, type (|?) (InL))
 import Language.LSP.Protocol.Types qualified as LSP
 import Language.LSP.VFS qualified as VFS
 import System.IO.Temp qualified as Temp
@@ -30,6 +31,7 @@ import Unison.LSP.FileAnalysis qualified as FileAnalysis
 import Unison.LSP.FileAnalysis.UnusedBindings qualified as UnusedBindings
 import Unison.LSP.Hover qualified as Hover
 import Unison.LSP.Queries qualified as LSPQ
+import Unison.LSP.SignatureHelp qualified as SigHelp
 import Unison.LSP.Types qualified as ULSP
 import Unison.Lexer.Pos qualified as Lexer
 import Unison.Parser.Ann (Ann (..))
@@ -48,6 +50,7 @@ import Unison.Type qualified as Type
 import Unison.UnisonFile qualified as UF
 import Unison.Util.Monoid (foldMapM)
 import Unison.Util.Recursion
+import Unison.Var qualified as Var
 import UnliftIO qualified
 
 test :: Test ()
@@ -65,6 +68,11 @@ test = do
   scope "hover" $
     tests
       [ localBindingHoverTest
+      ]
+  scope "signature-help" $
+    tests
+      [ signatureHelpFindEnclosingApp,
+        signatureHelpEndToEnd
       ]
 
 newtype TestLsp a = TestLsp {unTestLsp :: ReaderT ULSP.Env IO a}
@@ -634,6 +642,173 @@ term =
 -- recu^rse a = if true then a else recurse a
 --   |]
 -- )
+
+-- | Helper to extract the function name from a findEnclosingApp result.
+-- Returns the variable name if the function head is a Var, Nothing otherwise.
+funcName :: Term.Term Symbol Ann -> Maybe Text
+funcName t = case ABT.out t of
+  ABT.Var v -> Just (Var.name v)
+  _ -> Nothing
+
+-- | Test findEnclosingApp behavior including the cursorOnFuncHead guard.
+signatureHelpFindEnclosingApp :: Test ()
+signatureHelpFindEnclosingApp =
+  scope "findEnclosingApp" . tests $
+    [ makeFindEnclosingAppTest
+        "Cursor on first argument"
+        [here|
+term = let
+  f a b = a
+  f tr^ue false
+        |]
+        (Just ("f", 2, 0)),
+      makeFindEnclosingAppTest
+        "Cursor on second argument"
+        [here|
+term = let
+  f a b = a
+  f true fal^se
+        |]
+        (Just ("f", 2, 1)),
+      makeFindEnclosingAppTest
+        "Cursor on function head returns Nothing for that app"
+        [here|
+term = let
+  f a = a
+  f^ true
+        |]
+        Nothing,
+      makeFindEnclosingAppTest
+        "Nested: cursor on inner function name shows outer"
+        [here|
+term = let
+  outer a = a
+  inner a = a
+  outer (inn^er true)
+        |]
+        (Just ("outer", 1, 0)),
+      makeFindEnclosingAppTest
+        "Nested: cursor on inner argument shows inner"
+        [here|
+term = let
+  outer a = a
+  inner a = a
+  outer (inner tr^ue)
+        |]
+        (Just ("inner", 1, 0)),
+      makeFindEnclosingAppTest
+        "Multiple args: cursor between args"
+        [here|
+term = let
+  f a b c = a
+  f true ^false true
+        |]
+        (Just ("f", 3, 1)),
+      makeFindEnclosingAppTest
+        "Single arg: cursor on that arg"
+        [here|
+term = let
+  f a = a
+  f tru^e
+        |]
+        (Just ("f", 1, 0)),
+      makeFindEnclosingAppTest
+        "Constructor with two args: cursor on second"
+        [here|
+structural type Pair a b = Pair a b
+term = let
+  Pair "first" "sec^ond"
+        |]
+        (Just ("<non-var>", 2, 1)),
+      makeFindEnclosingAppTest
+        "Two args with long second string: cursor on second"
+        [here|
+structural type Pair a b = Pair a b
+term = let
+  Pair "short" "this is a lo^ng string with stuff"
+        |]
+        (Just ("<non-var>", 2, 1)),
+      makeFindEnclosingAppTest
+        "Constructor arg is another constructor (no sig help on it)"
+        [here|
+structural type Method = POST | GET
+term = let
+  f a b = a
+  f PO^ST true
+        |]
+        (Just ("f", 2, 0)),
+      makeFindEnclosingAppTest
+        "Parenthesized partial application: cursor on second arg"
+        [here|
+term = let
+  f a b = a
+  (f true) fal^se
+        |]
+        (Just ("f", 2, 1))
+    ]
+
+signatureHelpEndToEnd :: Test ()
+signatureHelpEndToEnd =
+  scope "end-to-end" . tests $
+    [ makeSignatureHelpTest
+        "Simple function call: cursor on argument"
+        [here|
+foo bar = bar
+aDemo bar = foo ba^r
+        |]
+        (Just 0),
+      makeSignatureHelpTest
+        "No sig help when cursor is on function head"
+        [here|
+foo bar = bar
+aDemo bar = fo^o bar
+        |]
+        Nothing
+    ]
+
+-- | End-to-end test for signature help. Runs the full sigHelp through the LSP test env.
+-- Expected is Just activeParamIdx, or Nothing if no signature help expected.
+makeSignatureHelpTest :: String -> Text -> Maybe UInt -> Test ()
+makeSignatureHelpTest name testSrc expected = scope name $ do
+  (pos, src) <- extractCursor testSrc
+  result <- runTestLsp . runMaybeT $ do
+    let srcName = "test-file"
+    let uri = LSP.Uri srcName
+    fileAnalysis <- FileAnalysis.checkFileContents uri srcName (0 :: ULSP.FileVersion) src
+    filesVar <- asks ULSP.checkedFilesVar
+    liftIO $ UnliftIO.atomically $ do
+      files <- UnliftIO.readTVar filesVar
+      case Map.lookup uri files of
+        Nothing -> do
+          mvar <- UnliftIO.newTMVar fileAnalysis
+          UnliftIO.modifyTVar' filesVar (Map.insert uri mvar)
+        Just mvar -> void $ UnliftIO.putTMVar mvar fileAnalysis
+    SigHelp.sigHelp uri (uToLspPos pos)
+  let actual =
+        result <&> \sh ->
+          sh ^. LSP.activeParameter & \case
+            Just (InL idx) -> idx
+            _ -> error "expected activeParameter to be set"
+  case (expected, actual) of
+    (Nothing, Nothing) -> ok
+    (Just expectedIdx, Just actualIdx) -> expectEqual expectedIdx actualIdx
+    _ -> crash $ "Expected " ++ show expected ++ " but got " ++ show actual
+
+-- | Makes a test for findEnclosingApp.
+-- Expected is (funcName, argCount, activeParamIndex) or Nothing if no match.
+makeFindEnclosingAppTest :: String -> Text -> Maybe (Text, Int, UInt) -> Test ()
+makeFindEnclosingAppTest name testSrc expected = scope name $ do
+  (pos, src) <- extractCursor testSrc
+  (pf, _) <- typecheckSrc name src
+  let terms =
+        UF.terms pf
+          & Map.toList
+          & fmap (\(_v, (_fileAnn, trm)) -> LSPQ.removeInferredTypeAnnotations trm)
+  let result = firstJust (SigHelp.findEnclosingApp pos) terms
+  let actual =
+        result <&> \(func, args, activeIdx) ->
+          (fromMaybe "<non-var>" (funcName func), Prelude.length args, activeIdx)
+  expectEqual expected actual
 
 typeMismatchLocations :: Test ()
 typeMismatchLocations =

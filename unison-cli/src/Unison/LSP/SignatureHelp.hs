@@ -10,6 +10,8 @@ import Language.LSP.Protocol.Types
 import Unison.ABT qualified as ABT
 import Unison.Codebase qualified as Codebase
 import Unison.ConstructorType qualified as CT
+import Unison.HashQualified qualified as HQ
+import Unison.Syntax.Name qualified as Name
 import Unison.LSP.Conversions (annToRange, lspToUPos)
 import Unison.LSP.FileAnalysis (getFileSummary, ppedForFile)
 import Unison.LSP.FileAnalysis qualified as FileAnalysis
@@ -20,6 +22,7 @@ import Unison.Lexer.Pos (Pos)
 import Unison.Parser.Ann (Ann)
 import Unison.Parser.Ann qualified as Ann
 import Unison.Prelude
+import Unison.PrettyPrintEnv qualified as PPE
 import Unison.PrettyPrintEnvDecl qualified as PPED
 import Unison.Reference qualified as Reference
 import Unison.Referent qualified as Referent
@@ -32,6 +35,7 @@ import Unison.Typechecker.Context qualified as Context
 import Unison.Typechecker.TypeVar qualified as TypeVar
 import Unison.UnisonFile.Summary (FileSummary (..))
 import Unison.Util.Pretty qualified as Pretty
+import Unison.Var qualified as Var
 
 signatureHelpHandler ::
   Msg.TRequestMessage 'Msg.Method_TextDocumentSignatureHelp ->
@@ -61,11 +65,15 @@ sigHelp uri pos = do
   let suffixifiedPPE = PPED.suffixifiedPPE pped
   let prettyWidth = Pretty.Width 40
 
+  -- Strip forall quantifiers before decomposing arrows.
+  -- The type may be `∀ a. a -> a` which needs unwrapping first.
+  let (_quantifiedVars, funcTypeBody) = Type.unForallsOpt funcType
+
   -- Decompose the function type into parameters.
   -- unEffectfulArrows handles effectful types like `a ->{IO} b -> c`
   -- It returns (firstParamType, [(maybeEffects, nextParamType), ...])
   -- where the last element in the list is the return type.
-  case Type.unEffectfulArrows funcType of
+  case Type.unEffectfulArrows funcTypeBody of
     Nothing -> empty -- not a function type
     Just (firstParam, rest) -> do
       let allTypes = firstParam : map snd rest
@@ -83,7 +91,7 @@ sigHelp uri pos = do
                 }
 
       let fullSig = TypePrinter.prettyStr prettyWidth suffixifiedPPE funcType
-      let funcLabel = renderFuncLabel funcTerm
+      let funcLabel = renderFuncLabel suffixifiedPPE funcTerm
       let sigLabel = funcLabel <> " : " <> fullSig
 
       pure
@@ -100,14 +108,15 @@ sigHelp uri pos = do
             _activeParameter = Just (InL activeParamIdx)
           }
 
--- | Get a short label for the function being called.
-renderFuncLabel :: Term Symbol Ann -> Text
-renderFuncLabel term = case ABT.out term of
-  ABT.Var v -> tShow v
+-- | Get a human-readable label for the function being called,
+-- using the PPE to resolve references to nice names.
+renderFuncLabel :: PPE.PrettyPrintEnv -> Term Symbol Ann -> Text
+renderFuncLabel ppe term = case ABT.out term of
+  ABT.Var v -> Var.name v
   ABT.Tm f -> case f of
-    Term.Ref ref -> tShow ref
-    Term.Constructor conRef -> tShow conRef
-    Term.Request conRef -> tShow conRef
+    Term.Ref ref -> HQ.toTextWith Name.toText $ PPE.termName ppe (Referent.Ref ref)
+    Term.Constructor conRef -> HQ.toTextWith Name.toText $ PPE.termName ppe (Referent.Con conRef CT.Data)
+    Term.Request conRef -> HQ.toTextWith Name.toText $ PPE.termName ppe (Referent.Con conRef CT.Effect)
     _ -> "fn"
   _ -> "fn"
 
@@ -168,15 +177,18 @@ refInTermForSigHelp term = case ABT.out term of
     _ -> Nothing
   _ -> Nothing
 
--- | Find the innermost function application chain that contains the given position,
+-- | Find the innermost function application chain where the cursor is on an argument,
 -- returning (function, arguments, active parameter index).
 --
 -- For a call like `f a b c` with cursor on `b`, returns `(f, [a, b, c], 1)`.
--- If the cursor is past the last argument but still within the application span,
--- the active parameter index is set to the number of arguments (pointing at the next param).
+-- Crucially, if the cursor is on the function head (e.g. on `f` itself), this does NOT
+-- match — we let the parent application claim it. This way, in `outer (inner x)` with
+-- the cursor on `inner`, we show `outer`'s signature (with `inner x` as the active param)
+-- rather than `inner`'s signature.
 findEnclosingApp :: Pos -> Term Symbol Ann -> Maybe (Term Symbol Ann, [Term Symbol Ann], UInt)
 findEnclosingApp pos term =
-  -- Try to find the deepest/innermost application first
+  -- Try to find a match in children first (deeper/innermost apps),
+  -- then try matching here.
   findInChildren <|> findHere
   where
     termAnn = ABT.annotation term
@@ -186,6 +198,9 @@ findEnclosingApp pos term =
       ABT.Tm (Term.App _ _)
         | termAnn `Ann.contains` pos -> do
             let (func, args) = collectApps term
+            -- Only match if the cursor is on an argument, NOT on the function head.
+            -- If the cursor is on the function head, this app isn't the right context.
+            guard (not $ cursorOnFuncHead pos func)
             let activeParam = findActiveParam pos args
             Just (func, args, activeParam)
       _ -> Nothing
@@ -193,7 +208,12 @@ findEnclosingApp pos term =
     findInChildren :: Maybe (Term Symbol Ann, [Term Symbol Ann], UInt)
     findInChildren = case ABT.out term of
       ABT.Tm f -> case f of
-        Term.App a b -> findEnclosingApp pos b <|> findEnclosingApp pos a
+        Term.App _ _ ->
+          -- For application chains, only recurse into the arguments,
+          -- NOT the left spine. Otherwise `App (App f a) b` with cursor on `a`
+          -- would match the inner `App f a` instead of the full chain.
+          let (_func, args) = collectApps term
+           in altMap (findEnclosingApp pos) args
         Term.Handle a b -> findEnclosingApp pos a <|> findEnclosingApp pos b
         Term.Ann a _typ -> findEnclosingApp pos a
         Term.List xs -> altSum (findEnclosingApp pos <$> xs)
@@ -215,6 +235,13 @@ findEnclosingApp pos term =
       ABT.Var {} -> Nothing
       ABT.Cycle r -> findEnclosingApp pos r
       ABT.Abs _v r -> findEnclosingApp pos r
+
+-- | Check if the cursor is on the function head of an application.
+-- The function head is the leftmost non-App term in the application chain.
+-- We walk through nested Apps to find the true function head and check
+-- if its annotation contains the cursor.
+cursorOnFuncHead :: Pos -> Term Symbol Ann -> Bool
+cursorOnFuncHead pos func = ABT.annotation func `Ann.contains` pos
 
 -- | Collect the function and all arguments from a chain of App nodes.
 -- `f a b c` is represented as `App (App (App f a) b) c`
