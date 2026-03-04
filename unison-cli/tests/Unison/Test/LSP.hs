@@ -898,12 +898,23 @@ demo = greet Greeting Na^me
         |]
         (Just (1, "greet : Greeting -> Name -> (Greeting, Name)", [Just "msg : Greeting", Just "who : Name"])),
       makeSignatureHelpTest
+        "Non-record constructor call"
+        [here|
+type A = A
+type B = B
+type Pair = Pair A B
+demo = Pair A ^B
+        |]
+        (Just (1, "Pair : A -> B -> Pair", [Nothing, Nothing])),
+      makeSignatureHelpTest
         "Record constructor field names"
         [here|
-type Request = { method : Text, id : Nat }
-demo = Request "foo" 4^2
+type Method = Method
+type Id = Id
+type Request = { method : Method, id : Id }
+demo = Request Method I^d
         |]
-        (Just (1, "Request : Text -> Nat -> Request", [Just "method : Text", Just "id : Nat"]))
+        (Just (1, "Request : Method -> Id -> Request", [Just "method : Method", Just "id : Id"]))
     ]
 
 makeSignatureHelpTest :: String -> Text -> Maybe (UInt, Text, [Maybe Text]) -> Test ()

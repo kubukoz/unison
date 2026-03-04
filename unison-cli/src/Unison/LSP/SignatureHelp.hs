@@ -170,26 +170,27 @@ getParamNames uri funcTerm = case ABT.out funcTerm of
 -- Records are identified as data declarations with exactly one constructor.
 -- Field names are recovered from the generated accessor terms in the file.
 getRecordFieldNames :: (Lspish m, MonadUnliftIO m) => Uri -> Reference.TypeReference -> ConstructorReference -> m [Text]
-getRecordFieldNames uri typeRef conRef = fromMaybe [] <$> runMaybeT do
-  -- Look up the data declaration
-  dd <- getDataDeclaration uri typeRef
-  -- Records have exactly one constructor
-  guard (DD.constructorCount dd == 1)
-  -- Get accessor terms from the file
-  FileSummary {termsBySymbol} <- getFileSummary uri
-  -- Collect getter terms: those whose name matches TypeName.fieldName
-  -- and whose body is a record getter (match with Var at exactly one position)
-  let getterEntries =
-        [ (fieldIdx, fieldName)
-        | (sym, (_ann, _ref, trm, _typ)) <- Map.toList termsBySymbol,
-          Just (typeName, fieldName) <- [splitAccessorName sym],
-          isGetterFor conRef typeName trm,
-          Just fieldIdx <- [getterFieldIndex trm]
-        ]
-  -- Sort by field index and return names in order
-  let sorted = map snd $ sortOn fst getterEntries
-  guard (not $ null sorted)
-  pure sorted
+getRecordFieldNames uri typeRef conRef =
+  fromMaybe [] <$> runMaybeT do
+    -- Look up the data declaration
+    dd <- getDataDeclaration uri typeRef
+    -- Records have exactly one constructor
+    guard (DD.constructorCount dd == 1)
+    -- Get accessor terms from the file
+    FileSummary {termsBySymbol} <- getFileSummary uri
+    -- Collect getter terms: those whose name matches TypeName.fieldName
+    -- and whose body is a record getter (match with Var at exactly one position)
+    let getterEntries =
+          [ (fieldIdx, fieldName)
+          | (sym, (_ann, _ref, trm, _typ)) <- Map.toList termsBySymbol,
+            Just (typeName, fieldName) <- [splitAccessorName sym],
+            isGetterFor conRef typeName trm,
+            Just fieldIdx <- [getterFieldIndex trm]
+          ]
+    -- Sort by field index and return names in order
+    let sorted = map snd $ sortOn fst getterEntries
+    guard (not $ null sorted)
+    pure sorted
 
 -- | Split a symbol name like "Request.method" into (typeName, fieldName).
 -- Returns Nothing if the name doesn't have exactly two segments.
@@ -293,7 +294,7 @@ generalize :: Type.Type Symbol Ann -> Context.Type Symbol Ann
 generalize = ABT.vmap TypeVar.Universal
 
 -- | Gets the type of a referent from either the parsed file or the codebase.
-getTypeOfReferent :: (Lspish m) => Uri -> Referent.Referent -> MaybeT m (Type.Type Symbol Ann)
+getTypeOfReferent :: (Lspish m, MonadUnliftIO m) => Uri -> Referent.Referent -> MaybeT m (Type.Type Symbol Ann)
 getTypeOfReferent fileUri ref =
   getFromFile <|> getFromCodebase
   where
@@ -303,7 +304,9 @@ getTypeOfReferent fileUri ref =
         Referent.Ref (Reference.Builtin {}) -> empty
         Referent.Ref (Reference.DerivedId termRefId) ->
           MaybeT . pure $ (termsByReference ^? ix (Just termRefId) . folded . _3 . _Just)
-        Referent.Con {} -> empty
+        Referent.Con (ConstructorReference typeRef conId) _ct -> do
+          dd <- getDataDeclaration fileUri typeRef
+          MaybeT . pure $ DD.typeOfConstructor dd conId
     getFromCodebase = do
       Env {codebase} <- ask
       MaybeT . liftIO $ Codebase.runTransaction codebase $ Codebase.getTypeOfReferent codebase ref
