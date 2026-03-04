@@ -764,6 +764,22 @@ term = let
         |]
         (Just ("++", 2, 1)),
       makeFindEnclosingAppTest
+        "Two string args: cursor inside second string"
+        [here|
+term = let
+  f a b = a
+  f "Location" ".^"
+        |]
+        (Just ("f", 2, 1)),
+      makeFindEnclosingAppTest
+        "Two string args: cursor at start of second string"
+        [here|
+term = let
+  f a b = a
+  f "Location" ^"."
+        |]
+        (Just ("f", 2, 1)),
+      makeFindEnclosingAppTest
         "Operator as arg: cursor on operator name shows outer func"
         [here|
 term = let
@@ -791,7 +807,54 @@ aDemo bar = foo ba^r
 foo bar = bar
 aDemo bar = fo^o bar
         |]
-        Nothing
+        Nothing,
+      makeSignatureHelpTest
+        "Two string args end-to-end: cursor on second"
+        [here|
+foo a b = a
+term = foo "Location" ".^"
+        |]
+        (Just 1),
+      makeSignatureHelpTest
+        "Dotted function name with two string args: cursor on second"
+        [here|
+headers.add a b = a
+term = headers.add "Location" ".^"
+        |]
+        (Just 1),
+      makeSignatureHelpTest
+        "Nested let with two string args: cursor on second"
+        [here|
+term =
+  f a b = a
+  f "Location" ".^"
+        |]
+        (Just 1),
+      makeSignatureHelpTest
+        "Do block with two string args: cursor on second"
+        [here|
+foo x y = x
+demo = do
+  foo "Location" ".^"
+        |]
+        (Just 1),
+      makeSignatureHelpTest
+        "Do block with effectful function: cursor on second arg"
+        [here|
+foo x y = do
+  _ = x ++ y
+  ()
+demo = do
+  foo "Location" ".^"
+        |]
+        (Just 1),
+      makeSignatureHelpTest
+        "Repro: top-level call with two string args"
+        [here|
+demo = foo "Location" ".^"
+foo x y = (x ++ y)
+        |]
+        (Just 1)
     ]
 
 -- | End-to-end test for signature help. Runs the full sigHelp through the LSP test env.

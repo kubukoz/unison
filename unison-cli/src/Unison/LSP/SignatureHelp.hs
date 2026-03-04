@@ -4,6 +4,7 @@ import Control.Lens hiding (List)
 import Control.Monad.Reader
 import Data.IntervalMap.Lazy qualified as IM
 import Data.List (findIndex)
+import Data.Text qualified as Text
 import Language.LSP.Protocol.Lens
 import Language.LSP.Protocol.Message qualified as Msg
 import Language.LSP.Protocol.Types
@@ -11,7 +12,6 @@ import Unison.ABT qualified as ABT
 import Unison.Codebase qualified as Codebase
 import Unison.ConstructorType qualified as CT
 import Unison.HashQualified qualified as HQ
-import Unison.Syntax.Name qualified as Name
 import Unison.LSP.Conversions (annToRange, lspToUPos)
 import Unison.LSP.FileAnalysis (getFileSummary, ppedForFile)
 import Unison.LSP.FileAnalysis qualified as FileAnalysis
@@ -27,6 +27,7 @@ import Unison.PrettyPrintEnvDecl qualified as PPED
 import Unison.Reference qualified as Reference
 import Unison.Referent qualified as Referent
 import Unison.Symbol (Symbol)
+import Unison.Syntax.Name qualified as Name
 import Unison.Syntax.TypePrinter qualified as TypePrinter
 import Unison.Term (Term)
 import Unison.Term qualified as Term
@@ -83,16 +84,42 @@ sigHelp uri pos = do
       guard (numParams > 0)
       guard (activeParamIdx < fromIntegral numParams)
 
-      let paramLabels =
-            take numParams allTypes <&> \paramType ->
-              ParameterInformation
-                { _label = InL (TypePrinter.prettyStr prettyWidth suffixifiedPPE paramType),
-                  _documentation = Nothing
-                }
-
-      let fullSig = TypePrinter.prettyStr prettyWidth suffixifiedPPE funcType
       let funcLabel = renderFuncLabel suffixifiedPPE funcTerm
-      let sigLabel = funcLabel <> " : " <> fullSig
+      let prefix = funcLabel <> " : "
+      let prettyType t = TypePrinter.prettyStr prettyWidth suffixifiedPPE t
+      let prettyEffects es = "{" <> Text.intercalate ", " (fmap prettyType es) <> "} "
+      -- Build the signature label with offset-based parameter labels.
+      -- We construct the type portion piece by piece to track offsets.
+      let prefixLen = fromIntegral (Text.length prefix)
+      let (sigParts, paramLabels, _) =
+            foldl'
+              ( \(parts, labels, offset) (idx, mayEffects, paramType) ->
+                  let paramStr = prettyType paramType
+                      paramLen = fromIntegral (Text.length paramStr)
+                      arrow
+                        | idx == 0 = ""
+                        | otherwise = case mayEffects of
+                            Nothing -> " -> "
+                            Just [] -> " -> "
+                            Just es -> " ->" <> prettyEffects es
+                      --
+                      arrowLen = fromIntegral (Text.length arrow)
+                      paramStart = offset + arrowLen
+                      paramEnd = paramStart + paramLen
+                      label =
+                        ParameterInformation
+                          { _label = InR (paramStart, paramEnd),
+                            _documentation = Nothing
+                          }
+                      isParam = idx < fromIntegral numParams
+                   in ( parts <> [arrow, paramStr],
+                        if isParam then labels <> [label] else labels,
+                        paramEnd
+                      )
+              )
+              ([], [], prefixLen)
+              (zip3 [(0 :: Int) ..] (Nothing : fmap fst rest) allTypes)
+      let sigLabel = prefix <> mconcat sigParts
 
       pure
         SignatureHelp
