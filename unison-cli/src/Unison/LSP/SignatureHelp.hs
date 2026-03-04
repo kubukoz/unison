@@ -2,9 +2,10 @@ module Unison.LSP.SignatureHelp where
 
 import Control.Lens hiding (List)
 import Control.Monad.Reader
-import Data.IntervalMap.Lazy qualified as IM
 import Data.Char (ord)
+import Data.IntervalMap.Lazy qualified as IM
 import Data.List (findIndex)
+import Data.Map.Strict qualified as Map
 import Data.Text qualified as Text
 import Language.LSP.Protocol.Lens
 import Language.LSP.Protocol.Message qualified as Msg
@@ -86,10 +87,10 @@ sigHelp uri pos = do
       -- Use the full type pretty-printer for the signature label.
       -- This correctly handles parenthesization and effects.
       let fullSig = TypePrinter.prettyStr prettyWidth suffixifiedPPE funcTypeBody
-      let sigLabel = prefix <> fullSig
       -- Split the rendered type at top-level arrows, then group segments
       -- to match the call-site arity.
-      let paramLabels = computeParamOffsets prefix fullSig numArgs
+      paramNames <- lift $ getParamNames uri funcTerm
+      let (sigLabel, paramLabels) = buildSignatureLabel prefix fullSig numArgs paramNames
 
       pure
         SignatureHelp
@@ -143,6 +144,52 @@ getFuncType uri funcTerm =
               IM.lookupMin $
                 IM.intersecting localBindingInfo (IM.ClosedInterval startPos startPos)
           pure typ
+
+-- | Get parameter names from the function definition, if available.
+-- Extracts variable names from the lambda abstractions of the term body.
+getParamNames :: (Lspish m, MonadUnliftIO m) => Uri -> Term Symbol Ann -> m [Text]
+getParamNames uri funcTerm = do
+  mayTerm <- runMaybeT $ getTermBody uri funcTerm
+  pure $ case mayTerm of
+    Just t -> case Term.unLams' (peelAnns t) of
+      Just (vs, _body) -> fmap Var.name vs
+      Nothing -> []
+    Nothing -> []
+
+-- | Get the term body for a function, looking in the file first, then the codebase.
+getTermBody :: (Lspish m, MonadUnliftIO m) => Uri -> Term Symbol Ann -> MaybeT m (Term Symbol Ann)
+getTermBody uri funcTerm = case ABT.out funcTerm of
+  ABT.Var v -> do
+    -- Local variable: look up its definition in the file's termsBySymbol.
+    -- We match by name rather than exact Symbol equality because the
+    -- typechecker may freshen the variable at the call site.
+    FileSummary {termsBySymbol} <- getFileSummary uri
+    let vName = Var.name v
+    MaybeT . pure . listToMaybe $
+      [ trm
+      | (sym, (_ann, _ref, trm, _typ)) <- Map.toList termsBySymbol,
+        Var.name sym == vName
+      ]
+  ABT.Tm f -> case f of
+    Term.Ref (Reference.DerivedId refId) -> do
+      -- Try file first, then codebase
+      let getFromFile = do
+            FileSummary {termsByReference} <- getFileSummary uri
+            MaybeT . pure $ termsByReference ^? ix (Just refId) . folded . _2
+          getFromCodebase = do
+            Env {codebase} <- ask
+            MaybeT . liftIO $ Codebase.runTransaction codebase $ Codebase.getTerm codebase refId
+      getFromFile <|> getFromCodebase
+    _ -> empty
+  _ -> empty
+
+-- | Peel off top-level Ann wrappers from a term.
+-- The typechecker wraps terms in Ann nodes (both inferred and user-provided).
+-- We need to strip these to find the underlying lambda parameters.
+peelAnns :: Term Symbol Ann -> Term Symbol Ann
+peelAnns t = case ABT.out t of
+  ABT.Tm (Term.Ann inner _typ) -> peelAnns inner
+  _ -> t
 
 -- | Generalize a Type from plain Symbol variables to TypeVar variables.
 generalize :: Type.Type Symbol Ann -> Context.Type Symbol Ann
@@ -273,65 +320,110 @@ safeAnnEnd (Ann.Ann _ e) = Just e
 safeAnnEnd (Ann.GeneratedFrom a) = safeAnnEnd a
 safeAnnEnd _ = Nothing
 
--- | Compute offset-based parameter labels by splitting the rendered type
--- string at top-level arrows, grouping segments to match call-site arity.
--- If the type has more arrows than args, extra arrows are grouped into
--- the first parameter (e.g. for a higher-order function taking a lambda).
--- Returns labels with UTF-16 offsets as required by the LSP spec.
-computeParamOffsets :: Text -> Text -> Int -> [ParameterInformation]
-computeParamOffsets prefix fullSig numArgs =
-  let segments = splitTopLevelArrows fullSig
-      -- segments has (typeArity + 1) entries (params + return type)
-      typeArity = Prelude.length segments - 1
-      -- Group segments to match call-site arity
-      grouped
-        | numArgs >= typeArity = take numArgs segments
-        | otherwise =
-            -- Group the first (typeArity - numArgs + 1) segments into one param.
-            -- The grouped span goes from the start of the first segment to the
-            -- end of the last segment in the group.
-            let groupSize = typeArity - numArgs + 1
-                groupSegs = take groupSize segments
-                remaining = take (numArgs - 1) (drop groupSize segments)
-             in case (groupSegs, reverse groupSegs) of
-                  ((groupStart, _) : _, (lastStart, lastLen) : _) ->
-                    let groupEnd = lastStart + lastLen
-                     in (groupStart, groupEnd - groupStart) : remaining
-                  _ -> segments
-      -- Convert codepoint-based (offset, len) to UTF-16 (start, end) offsets.
-      -- The full label is prefix <> fullSig, so we convert offsets within
-      -- fullSig by adding the UTF-16 length of the prefix.
-      prefixU16 = utf16Length prefix
-      sigChars = Text.unpack fullSig
-      -- Build a mapping from codepoint index to UTF-16 offset within fullSig
-      cpToU16 cpIdx = foldl' (\acc c -> acc + utf16Width c) 0 (take (fromIntegral cpIdx) sigChars)
-   in fmap
-        ( \(cpOff, cpLen) ->
-            let u16Start = prefixU16 + cpToU16 cpOff
-                u16End = prefixU16 + cpToU16 (cpOff + cpLen)
-             in ParameterInformation
-                  { _label = InR (u16Start, u16End),
-                    _documentation = Nothing
-                  }
-        )
-        grouped
+--
 
--- | Split a rendered type string at top-level " -> " arrows,
--- returning (offset, length) pairs for each segment.
--- All offsets are in codepoints (Haskell Char indices).
--- Use 'cpToUtf16' to convert to UTF-16 offsets for LSP.
+-- | Build the full signature label with parameter names inlined, and compute
+-- offset-based parameter labels. For a function `foo(a, b) : Text -> Nat -> Bool`,
+-- produces label "foo : (a : Text) -> (b : Nat) -> Bool" with offsets pointing
+-- to each "(name : Type)" span.
+--
+-- Splits the rendered type at top-level arrows, groups segments to match
+-- call-site arity, prepends parameter names where available, then reassembles.
+buildSignatureLabel :: Text -> Text -> Int -> [Text] -> (Text, [ParameterInformation])
+buildSignatureLabel prefix fullSig numArgs paramNames =
+  let (segments, arrows) = splitTopLevelArrows fullSig
+      -- segments has (typeArity + 1) entries; arrows has typeArity entries
+      typeArity = Prelude.length segments - 1
+      nParams = min numArgs typeArity
+      -- Group segments into nParams parameter chunks + return type.
+      -- If typeArity > nParams, merge the first (typeArity - nParams + 1)
+      -- segments into one parameter (for higher-order function args).
+      groupSize = typeArity - nParams + 1
+      -- Each param chunk is a list of (segment, trailing arrow) pairs,
+      -- except the last segment in a chunk has no trailing arrow.
+      paramChunks = makeChunks groupSize nParams segments arrows
+      -- Return type is everything after the params
+      retStart = groupSize + nParams - 1
+      retSegs = drop retStart segments
+      retArrows = drop retStart arrows
+      returnText = mconcat $ interleave retSegs retArrows
+      -- Decorate each param chunk with its name
+      names = (fmap Just paramNames <> repeat Nothing) & take nParams
+      chunkTexts = fmap (\segsAndArrows -> mconcat $ interleave (fmap fst segsAndArrows) (fmap snd segsAndArrows)) paramChunks
+      labeledParams = zipWith decorateSeg names chunkTexts
+      -- Get the arrows between params (arrow after each grouped chunk)
+      paramSepArrows = take (nParams - 1) (drop (groupSize - 1) arrows)
+      -- Arrow between last param and return type
+      lastArrow = case drop (retStart - 1) arrows of
+        (a : _) -> a
+        [] -> " -> "
+      -- Assemble the label
+      paramPart = mconcat $ interleave labeledParams paramSepArrows
+      sigBody = if null retSegs then paramPart else paramPart <> lastArrow <> returnText
+      sigLabel = prefix <> sigBody
+      -- Compute UTF-16 offsets for each labeled param
+      prefixU16 = utf16Length prefix
+      allSepArrows = paramSepArrows <> [lastArrow]
+      paramInfos = snd $ foldl'
+        (\(curOffset, acc) (seg, idx) ->
+          let segU16 = utf16Length seg
+              arrowU16 = if idx < Prelude.length allSepArrows
+                         then utf16Length (allSepArrows !! idx)
+                         else 0
+              info = ParameterInformation
+                { _label = InR (curOffset, curOffset + segU16),
+                  _documentation = Nothing
+                }
+           in (curOffset + segU16 + arrowU16, acc <> [info])
+        )
+        (prefixU16, [])
+        (zip labeledParams [0 :: Int ..])
+   in (sigLabel, paramInfos)
+  where
+    decorateSeg :: Maybe Text -> Text -> Text
+    decorateSeg (Just n) typeSeg = "(" <> n <> " : " <> typeSeg <> ")"
+    decorateSeg Nothing typeSeg = typeSeg
+
+    -- Build nParams chunks from segments and arrows.
+    -- The first chunk has groupSize segments, the rest have 1 each.
+    makeChunks :: Int -> Int -> [Text] -> [Text] -> [[(Text, Text)]]
+    makeChunks _ 0 _ _ = []
+    makeChunks gs nP segs arrs =
+      let chunkSegs = take gs segs
+          chunkArrows = take (gs - 1) arrs
+          -- Pair each segment with its trailing arrow (last seg gets "")
+          chunk = zipWith (,) chunkSegs (chunkArrows <> [""])
+          rest = makeChunks 1 (nP - 1) (drop gs segs) (drop gs arrs)
+       in chunk : rest
+
+-- | Interleave two lists: [a,b,c] [x,y] -> [a,x,b,y,c]
+interleave :: [a] -> [a] -> [a]
+interleave [] _ = []
+interleave [x] _ = [x]
+interleave (x : xs) (y : ys) = x : y : interleave xs ys
+interleave (x : xs) [] = x : xs
+
+-- | Split a rendered type string at top-level " -> " arrows.
+-- Returns (segments, arrows) where segments are the type parts between arrows,
+-- and arrows are the full separator strings (e.g. " -> " or " ->{e} ").
+-- segments always has one more element than arrows.
 -- Respects nesting in (), {}, and [].
-splitTopLevelArrows :: Text -> [(UInt, UInt)]
+splitTopLevelArrows :: Text -> ([Text], [Text])
 splitTopLevelArrows txt = go 0 0 0 (Text.unpack txt)
   where
-    go :: Int -> UInt -> UInt -> String -> [(UInt, UInt)]
-    go _depth segStart pos [] = [(segStart, pos - segStart)]
+    go :: Int -> Int -> Int -> String -> ([Text], [Text])
+    go _depth segStart pos [] =
+      ([textSlice segStart pos], [])
     go depth segStart pos ('-' : '>' : rest)
       | depth == 0 =
-          let segLen = trimTrailingSpace segStart (pos - segStart)
-              (consumed, rest') = skipArrowPrefix rest
-              newStart = pos + 2 + consumed
-           in (segStart, segLen) : go depth newStart newStart rest'
+          let seg = Text.stripEnd $ textSlice segStart pos
+              (skipped, rest') = skipArrowPrefix rest
+              newStart = pos + 2 + skipped
+              -- Arrow text: from end of trimmed segment to start of next segment
+              arrowStart = segStart + Text.length seg
+              arrow = textSlice arrowStart newStart
+              (segs, arrows) = go depth newStart newStart rest'
+           in (seg : segs, arrow : arrows)
     go depth segStart pos (c : rest) =
       let depth' = case c of
             '(' -> depth + 1
@@ -343,20 +435,18 @@ splitTopLevelArrows txt = go 0 0 0 (Text.unpack txt)
             _ -> depth
        in go depth' segStart (pos + 1) rest
 
-    trimTrailingSpace :: UInt -> UInt -> UInt
-    trimTrailingSpace segStart segLen =
-      let segText = Text.take (fromIntegral segLen) (Text.drop (fromIntegral segStart) txt)
-       in fromIntegral . Text.length $ Text.stripEnd segText
+    textSlice :: Int -> Int -> Text
+    textSlice start end = Text.take (end - start) (Text.drop start txt)
 
-    -- Skip spaces and effect annotations after "->"
-    skipArrowPrefix :: String -> (UInt, String)
+    -- Skip spaces and effect annotations after "->", return count and remaining
+    skipArrowPrefix :: String -> (Int, String)
     skipArrowPrefix (' ' : rest) = let (n, r) = skipArrowPrefix rest in (n + 1, r)
     skipArrowPrefix ('{' : rest) =
       let (n, rest') = skipUntilClose rest
        in skipArrowPrefix rest' & \(m, r) -> (1 + n + m, r)
     skipArrowPrefix s = (0, s)
 
-    skipUntilClose :: String -> (UInt, String)
+    skipUntilClose :: String -> (Int, String)
     skipUntilClose [] = (0, [])
     skipUntilClose ('}' : rest) =
       case rest of

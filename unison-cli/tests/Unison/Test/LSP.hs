@@ -800,7 +800,7 @@ signatureHelpEndToEnd =
 foo bar = bar
 aDemo bar = foo ba^r
         |]
-        (Just (0, "foo : bar -> bar")),
+        (Just (0, "foo : (bar : bar) -> bar", [Nothing])),
       makeSignatureHelpTest
         "No sig help when cursor is on function head"
         [here|
@@ -814,14 +814,14 @@ aDemo bar = fo^o bar
 foo a b = a
 term = foo "Location" ".^"
         |]
-        (Just (1, "foo : a -> b -> a")),
+        (Just (1, "foo : (a : a) -> (b : b) -> a", [Nothing, Nothing])),
       makeSignatureHelpTest
         "Dotted function name with two string args: cursor on second"
         [here|
 headers.add a b = a
 term = headers.add "Location" ".^"
         |]
-        (Just (1, "add : a -> b -> a")),
+        (Just (1, "add : (a : a) -> (b : b) -> a", [Nothing, Nothing])),
       makeSignatureHelpTest
         "Nested let with two string args: cursor on second"
         [here|
@@ -829,7 +829,7 @@ term =
   f a b = a
   f "Location" ".^"
         |]
-        (Just (1, "f : a -> b -> a")),
+        (Just (1, "f : a -> b -> a", [Nothing, Nothing])),
       makeSignatureHelpTest
         "Do block with two string args: cursor on second"
         [here|
@@ -837,59 +837,69 @@ foo x y = x
 demo = do
   foo "Location" ".^"
         |]
-        (Just (1, "foo : x -> y -> x")),
+        (Just (1, "foo : (x : x) -> (y : y) -> x", [Nothing, Nothing])),
       makeSignatureHelpTest
         "Repro: top-level call with two string args"
         [here|
 demo = foo "Location" ".^"
 foo x y = (x ++ y)
         |]
-        (Just (1, "foo : x -> y -> \120163")),
+        (Just (1, "foo : (x : x) -> (y : y) -> \120163", [Nothing, Nothing])),
       makeSignatureHelpTest
         "Higher-order function: cursor on first arg (lambda)"
         [here|
 mymap f x = f x
 demo = mymap (a -> a) tru^e
         |]
-        (Just (1, "mymap : (i ->{\120150} o) -> i ->{\120150} o")),
+        (Just (1, "mymap : (f : (i ->{\120150} o)) -> (x : i) ->{\120150} o", [Nothing, Nothing])),
       makeSignatureHelpTest
         "Higher-order function: cursor on lambda arg"
         [here|
 mymap f x = f x
 demo = mymap (a -> a^) true
         |]
-        (Just (0, "mymap : (i ->{\120150} o) -> i ->{\120150} o")),
+        (Just (0, "mymap : (f : (i ->{\120150} o)) -> (x : i) ->{\120150} o", [Nothing, Nothing])),
       makeSignatureHelpTest
         "Higher-order function with 3 type arrows, 2 args: cursor on second"
         [here|
 mymap f x = f x
 demo = mymap (a -> a) tru^e
         |]
-        (Just (1, "mymap : (i ->{\120150} o) -> i ->{\120150} o")),
+        (Just (1, "mymap : (f : (i ->{\120150} o)) -> (x : i) ->{\120150} o", [Nothing, Nothing])),
       makeSignatureHelpTest
         "Three-arg function: cursor on third"
         [here|
 foo a b c = a
 demo = foo 1 2 ^3
         |]
-        (Just (2, "foo : a -> b -> c -> a")),
+        (Just (2, "foo : (a : a) -> (b : b) -> (c : c) -> a", [Nothing, Nothing, Nothing])),
       makeSignatureHelpTest
         "Effectful two-arg function: cursor on first"
         [here|
 foo a b = !b
 demo = foo ^1 '2
         |]
-        (Just (0, "foo : a -> '{\120150} \120169 ->{\120150} \120169")),
+        (Just (0, "foo : (a : a) -> (b : '{\120150} \120169) ->{\120150} \120169", [Nothing, Nothing])),
       makeSignatureHelpTest
         "Effectful two-arg function: cursor on second"
         [here|
 foo a b = !b
 demo = foo 1 '^2
         |]
-        (Just (1, "foo : a -> '{\120150} \120169 ->{\120150} \120169"))
+        (Just (1, "foo : (a : a) -> (b : '{\120150} \120169) ->{\120150} \120169", [Nothing, Nothing])),
+      makeSignatureHelpTest
+        "Param names differ from type names"
+        [here|
+type Greeting = Greeting
+type Name = Name
+greet : Greeting -> Name -> (Greeting, Name)
+greet msg who = (msg, who)
+demo = greet Greeting Na^me
+        |]
+        (Just (1, "greet : (msg : Greeting) -> (who : Name) -> (Greeting, Name)", [Nothing, Nothing]))
     ]
 
-makeSignatureHelpTest :: String -> Text -> Maybe (UInt, Text) -> Test ()
+makeSignatureHelpTest :: String -> Text -> Maybe (UInt, Text, [Maybe Text]) -> Test ()
 makeSignatureHelpTest name testSrc expected = scope name $ do
   (pos, src) <- extractCursor testSrc
   result <- runTestLsp . runMaybeT $ do
@@ -909,12 +919,22 @@ makeSignatureHelpTest name testSrc expected = scope name $ do
         result <&> \sh ->
           let idx = sh ^. LSP.activeParameter & \case
                 Just (InL i) -> i
-                _ -> error "expected activeParameter to be set"
-              lbl = case sh ^. LSP.signatures of
-                [sig] -> sig ^. LSP.label
-                _ -> error "expected exactly one signature"
-           in (idx, lbl)
+                _ -> Prelude.error "expected activeParameter to be set"
+              sig = case sh ^. LSP.signatures of
+                [s] -> s
+                _ -> Prelude.error "expected exactly one signature"
+              lbl = sig ^. LSP.label
+              paramDocs =
+                case sig ^. LSP.parameters of
+                  Just ps -> fmap extractParamDoc ps
+                  Nothing -> []
+           in (idx, lbl, paramDocs)
   expectEqual expected actual
+  where
+    extractParamDoc :: LSP.ParameterInformation -> Maybe Text
+    extractParamDoc p = case p ^. LSP.documentation of
+      Just (InL t) -> Just t
+      _ -> Nothing
 
 -- | Makes a test for findEnclosingApp.
 -- Expected is (funcName, argCount, activeParamIndex) or Nothing if no match.
