@@ -800,7 +800,7 @@ signatureHelpEndToEnd =
 foo bar = bar
 aDemo bar = foo ba^r
         |]
-        (Just (0, "foo : (bar : bar) -> bar", [Nothing])),
+        (Just (0, "foo : bar -> bar", [Just "bar : bar"])),
       makeSignatureHelpTest
         "No sig help when cursor is on function head"
         [here|
@@ -814,14 +814,14 @@ aDemo bar = fo^o bar
 foo a b = a
 term = foo "Location" ".^"
         |]
-        (Just (1, "foo : (a : a) -> (b : b) -> a", [Nothing, Nothing])),
+        (Just (1, "foo : a -> b -> a", [Just "a : a", Just "b : b"])),
       makeSignatureHelpTest
         "Dotted function name with two string args: cursor on second"
         [here|
 headers.add a b = a
 term = headers.add "Location" ".^"
         |]
-        (Just (1, "add : (a : a) -> (b : b) -> a", [Nothing, Nothing])),
+        (Just (1, "add : a -> b -> a", [Just "a : a", Just "b : b"])),
       makeSignatureHelpTest
         "Nested let with two string args: cursor on second"
         [here|
@@ -837,56 +837,56 @@ foo x y = x
 demo = do
   foo "Location" ".^"
         |]
-        (Just (1, "foo : (x : x) -> (y : y) -> x", [Nothing, Nothing])),
+        (Just (1, "foo : x -> y -> x", [Just "x : x", Just "y : y"])),
       makeSignatureHelpTest
         "Repro: top-level call with two string args"
         [here|
 demo = foo "Location" ".^"
 foo x y = (x ++ y)
         |]
-        (Just (1, "foo : (x : x) -> (y : y) -> \120163", [Nothing, Nothing])),
+        (Just (1, "foo : x -> y -> \120163", [Just "x : x", Just "y : y"])),
       makeSignatureHelpTest
         "Higher-order function: cursor on first arg (lambda)"
         [here|
 mymap f x = f x
 demo = mymap (a -> a) tru^e
         |]
-        (Just (1, "mymap : (f : (i ->{\120150} o)) -> (x : i) ->{\120150} o", [Nothing, Nothing])),
+        (Just (1, "mymap : (i ->{\120150} o) -> i ->{\120150} o", [Just "f : (i ->{\120150} o)", Just "x : i"])),
       makeSignatureHelpTest
         "Higher-order function: cursor on lambda arg"
         [here|
 mymap f x = f x
 demo = mymap (a -> a^) true
         |]
-        (Just (0, "mymap : (f : (i ->{\120150} o)) -> (x : i) ->{\120150} o", [Nothing, Nothing])),
+        (Just (0, "mymap : (i ->{\120150} o) -> i ->{\120150} o", [Just "f : (i ->{\120150} o)", Just "x : i"])),
       makeSignatureHelpTest
         "Higher-order function with 3 type arrows, 2 args: cursor on second"
         [here|
 mymap f x = f x
 demo = mymap (a -> a) tru^e
         |]
-        (Just (1, "mymap : (f : (i ->{\120150} o)) -> (x : i) ->{\120150} o", [Nothing, Nothing])),
+        (Just (1, "mymap : (i ->{\120150} o) -> i ->{\120150} o", [Just "f : (i ->{\120150} o)", Just "x : i"])),
       makeSignatureHelpTest
         "Three-arg function: cursor on third"
         [here|
 foo a b c = a
 demo = foo 1 2 ^3
         |]
-        (Just (2, "foo : (a : a) -> (b : b) -> (c : c) -> a", [Nothing, Nothing, Nothing])),
+        (Just (2, "foo : a -> b -> c -> a", [Just "a : a", Just "b : b", Just "c : c"])),
       makeSignatureHelpTest
         "Effectful two-arg function: cursor on first"
         [here|
 foo a b = !b
 demo = foo ^1 '2
         |]
-        (Just (0, "foo : (a : a) -> (b : '{\120150} \120169) ->{\120150} \120169", [Nothing, Nothing])),
+        (Just (0, "foo : a -> '{\120150} \120169 ->{\120150} \120169", [Just "a : a", Just "b : '{\120150} \120169"])),
       makeSignatureHelpTest
         "Effectful two-arg function: cursor on second"
         [here|
 foo a b = !b
 demo = foo 1 '^2
         |]
-        (Just (1, "foo : (a : a) -> (b : '{\120150} \120169) ->{\120150} \120169", [Nothing, Nothing])),
+        (Just (1, "foo : a -> '{\120150} \120169 ->{\120150} \120169", [Just "a : a", Just "b : '{\120150} \120169"])),
       makeSignatureHelpTest
         "Param names differ from type names"
         [here|
@@ -896,7 +896,7 @@ greet : Greeting -> Name -> (Greeting, Name)
 greet msg who = (msg, who)
 demo = greet Greeting Na^me
         |]
-        (Just (1, "greet : (msg : Greeting) -> (who : Name) -> (Greeting, Name)", [Nothing, Nothing]))
+        (Just (1, "greet : Greeting -> Name -> (Greeting, Name)", [Just "msg : Greeting", Just "who : Name"]))
     ]
 
 makeSignatureHelpTest :: String -> Text -> Maybe (UInt, Text, [Maybe Text]) -> Test ()

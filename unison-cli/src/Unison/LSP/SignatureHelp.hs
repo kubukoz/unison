@@ -322,13 +322,11 @@ safeAnnEnd _ = Nothing
 
 --
 
--- | Build the full signature label with parameter names inlined, and compute
--- offset-based parameter labels. For a function `foo(a, b) : Text -> Nat -> Bool`,
--- produces label "foo : (a : Text) -> (b : Nat) -> Bool" with offsets pointing
--- to each "(name : Type)" span.
+-- | Build the full signature label and compute offset-based parameter labels
+-- with optional documentation (e.g. "msg : Greeting") for each parameter.
 --
--- Splits the rendered type at top-level arrows, groups segments to match
--- call-site arity, prepends parameter names where available, then reassembles.
+-- The label is the plain rendered type prefixed by the function name.
+-- Parameter names, when available, go into the _documentation field.
 buildSignatureLabel :: Text -> Text -> Int -> [Text] -> (Text, [ParameterInformation])
 buildSignatureLabel prefix fullSig numArgs paramNames =
   let (segments, arrows) = splitTopLevelArrows fullSig
@@ -347,42 +345,43 @@ buildSignatureLabel prefix fullSig numArgs paramNames =
       retSegs = drop retStart segments
       retArrows = drop retStart arrows
       returnText = mconcat $ interleave retSegs retArrows
-      -- Decorate each param chunk with its name
-      names = (fmap Just paramNames <> repeat Nothing) & take nParams
+      -- Plain chunk texts (no decoration)
       chunkTexts = fmap (\segsAndArrows -> mconcat $ interleave (fmap fst segsAndArrows) (fmap snd segsAndArrows)) paramChunks
-      labeledParams = zipWith decorateSeg names chunkTexts
       -- Get the arrows between params (arrow after each grouped chunk)
       paramSepArrows = take (nParams - 1) (drop (groupSize - 1) arrows)
       -- Arrow between last param and return type
       lastArrow = case drop (retStart - 1) arrows of
         (a : _) -> a
         [] -> " -> "
-      -- Assemble the label
-      paramPart = mconcat $ interleave labeledParams paramSepArrows
+      -- Assemble the label (plain, no param name decoration)
+      paramPart = mconcat $ interleave chunkTexts paramSepArrows
       sigBody = if null retSegs then paramPart else paramPart <> lastArrow <> returnText
       sigLabel = prefix <> sigBody
-      -- Compute UTF-16 offsets for each labeled param
+      -- Build documentation from param names
+      names = (fmap Just paramNames <> repeat Nothing) & take nParams
+      docs = fmap mkDoc (zip names chunkTexts)
+      -- Compute UTF-16 offsets for each plain param chunk
       prefixU16 = utf16Length prefix
       allSepArrows = paramSepArrows <> [lastArrow]
       paramInfos = snd $ foldl'
-        (\(curOffset, acc) (seg, idx) ->
+        (\(curOffset, acc) (seg, doc, idx) ->
           let segU16 = utf16Length seg
               arrowU16 = if idx < Prelude.length allSepArrows
                          then utf16Length (allSepArrows !! idx)
                          else 0
               info = ParameterInformation
                 { _label = InR (curOffset, curOffset + segU16),
-                  _documentation = Nothing
+                  _documentation = doc
                 }
            in (curOffset + segU16 + arrowU16, acc <> [info])
         )
         (prefixU16, [])
-        (zip labeledParams [0 :: Int ..])
+        (zip3 chunkTexts docs [0 :: Int ..])
    in (sigLabel, paramInfos)
   where
-    decorateSeg :: Maybe Text -> Text -> Text
-    decorateSeg (Just n) typeSeg = "(" <> n <> " : " <> typeSeg <> ")"
-    decorateSeg Nothing typeSeg = typeSeg
+    mkDoc :: (Maybe Text, Text) -> Maybe (Text |? MarkupContent)
+    mkDoc (Just n, typeSeg) = Just (InL (n <> " : " <> typeSeg))
+    mkDoc (Nothing, _) = Nothing
 
     -- Build nParams chunks from segments and arrows.
     -- The first chunk has groupSize segments, the rest have 1 each.
