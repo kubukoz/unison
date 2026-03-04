@@ -744,7 +744,35 @@ term = let
   f a b = a
   (f true) fal^se
         |]
-        (Just ("f", 2, 1))
+        (Just ("f", 2, 1)),
+      makeFindEnclosingAppTest
+        "Operator: cursor on lhs"
+        [here|
+term = let
+  a = "hello"
+  b = " world"
+  a^ ++ b
+        |]
+        (Just ("++", 2, 0)),
+      makeFindEnclosingAppTest
+        "Operator: cursor on rhs"
+        [here|
+term = let
+  a = "hello"
+  b = " world"
+  a ++ b^
+        |]
+        (Just ("++", 2, 1)),
+      makeFindEnclosingAppTest
+        "Operator as arg: cursor on operator name shows outer func"
+        [here|
+term = let
+  f a = a
+  a = "hello"
+  b = " world"
+  f (a +^+ b)
+        |]
+        (Just ("f", 1, 0))
     ]
 
 signatureHelpEndToEnd :: Test ()
